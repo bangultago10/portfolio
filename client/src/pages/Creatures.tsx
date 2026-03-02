@@ -1,130 +1,302 @@
-// Creatures.tsx
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Plus, Pencil, SlidersHorizontal } from "lucide-react";
+
 import { usePortfolioContext } from "@/contexts/PortfolioContext";
-import {
-  Plus,
-  Trash2,
-  X,
-  ChevronLeft,
-  ChevronRight,
-  Pencil,
-} from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import ImageUpload from "@/components/ImageUpload";
-import Modal from "@/components/ui/modal";
+
 import GButton from "@/components/ui/gyeol-button";
-import { useResolvedImage } from "@/hooks/useResolvedImage";
+import EntityGridCard from "@/components/entities/entity-grid-card";
+import EntityDetailFullscreen from "@/components/entities/detail/EntityDetailFullscreen";
+import EntityCategoryBar from "@/components/entities/entity-category-bar";
+import ConfirmModal from "@/components/ui/confirm-modal";
+import { HUDPanel, HUDBadge } from "@/components/ui/hud";
+import CategoryGroupEditModal, {
+  CategoryGroup,
+} from "@/components/entities/category-group-edit-modal";
 
-type SubImage = { image: string; description: string };
+import type {
+  CreatureData,
+  ID,
+  CategoryItem,
+  FramePresetId,
+} from "@/types";
 
-type Creature = {
-  id: string;
-  name: string;
+import { cn } from "@/lib/utils";
+import { OUTER_PRESETS } from "@/lib/framePresets";
 
-  // ✅ 크리쳐는 서브카테고리(태그)만 여러개 보유
-  subCategories: string[];
-
-  profileImage: string;
-  mainImage: string;
-  mainImageDesc?: string;
-  subImages: SubImage[];
-  tags: string[];
-  description: string;
-};
-
-type CategoryGroup = { main: string; subs: string[] };
+import {
+  normalizeSymbolColors,
+  normalizeSubImages,
+  sanitizeSymbolColors,
+  sanitizeSubImages,
+  symbolColorsEqual,
+  subImagesEqual,
+} from "@/lib/entityNormalize";
+import EntityFrameSettingsModal from "@/components/entities/frame-setting-modal";
 
 const ALL = "전체";
+
+function isOuterPreset(id: FramePresetId) {
+  return OUTER_PRESETS.has(id);
+}
+
+function makeId(): ID {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID() as ID;
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}` as ID;
+}
+
+/** SettingsData(CategoryItem[]) -> UI(CategoryGroup[]) 어댑터 */
+function toCategoryGroups(items: CategoryItem[] = []): CategoryGroup[] {
+  return items.map((x) => ({ main: x.main, subs: x.subs || [] }));
+}
+/** UI(CategoryGroup[]) -> SettingsData(CategoryItem[]) 어댑터 */
+function toCategoryItems(groups: CategoryGroup[] = []): CategoryItem[] {
+  return groups.map((g) => ({ main: g.main, subs: g.subs || [] }));
+}
+
+/** ✅ 프레임 draft: OUTER 1개 + INNER 1개 */
+type FrameDraft = {
+  outer: FramePresetId; // "none" 포함
+  inner: FramePresetId; // "none" 포함
+};
+
+function arraysShallowEqual(a: any[] = [], b: any[] = []) {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+function creatureEqual(a: CreatureData, b: CreatureData) {
+  return (
+    a.name === b.name &&
+    a.rankId === b.rankId &&
+    arraysShallowEqual(a.subCategories || [], b.subCategories || []) &&
+    a.profileImage === b.profileImage &&
+    a.mainImage === b.mainImage &&
+    subImagesEqual(a.subImages || [], b.subImages || []) &&
+    arraysShallowEqual(a.tags || [], b.tags || []) &&
+    symbolColorsEqual(a.symbolColors || [], b.symbolColors || []) &&
+    a.summary === b.summary &&
+    a.description === b.description &&
+    a.meta === b.meta
+  );
+}
 
 export default function Creatures() {
   const { data, setData, editMode } = usePortfolioContext();
 
-  // ✅ Categories
-  const categories: CategoryGroup[] = data.settings?.creatureCategories || [];
+  /** ✅ settings 기반 ranks */
+  const rankSet = data.settings?.rankSets?.creatures;
 
-  // ✅ 기존 데이터 호환
-  const creaturesNormalized: Creature[] = (data.creatures || []).map((c: any) => ({
-    ...c,
-    subCategories: Array.isArray(c.subCategories)
-      ? c.subCategories
-      : c.subCategory
-        ? [c.subCategory]
-        : [],
-    profileImage: c.profileImage || "",
-    mainImage: c.mainImage || "",
-    mainImageDesc: c.mainImageDesc || "",
-    subImages: Array.isArray(c.subImages) ? c.subImages : [],
-    tags: Array.isArray(c.tags) ? c.tags : [],
-    description: c.description || "",
-  }));
+  const defaultRankIdResolved: ID = useMemo(() => {
+    const tiers = rankSet?.tiers || [];
+    return (
+      (rankSet?.defaultTierId as ID) ||
+      (tiers[0]?.id as ID) ||
+      ("rank_default" as ID)
+    );
+  }, [rankSet]);
 
-  const [selectedId, setSelectedId] = useState<string | null>(
-    creaturesNormalized[0]?.id || null
+  /** ✅ 카드에 내려줄 frameSettings(최소 구독 단위) */
+  const frameSettingsCreatures = useMemo(() => {
+    return (data.settings as any)?.frameSettings?.creatures;
+  }, [data.settings]);
+
+  /** ✅ categories */
+  const categories: CategoryGroup[] = useMemo(() => {
+    return toCategoryGroups(data.settings?.creatureCategories || []);
+  }, [data.settings?.creatureCategories]);
+
+  /** normalize cache */
+  const normalizedCacheRef = useRef<Map<ID, CreatureData>>(new Map());
+
+  const creaturesNormalized: CreatureData[] = useMemo(() => {
+    const list: any[] = (data.creatures as any[]) || [];
+    const nextCache = new Map<ID, CreatureData>();
+    const prevCache = normalizedCacheRef.current;
+
+    const normalized = list.map((raw: any) => {
+      const id = String(raw?.id ?? makeId()) as ID;
+
+      const rankId: ID =
+        (raw?.rankId as ID) || defaultRankIdResolved || ("rank_default" as ID);
+
+      const nextObj: CreatureData = {
+        id,
+        name: String(raw?.name ?? "Unnamed"),
+        rankId,
+        subCategories: Array.isArray(raw?.subCategories)
+          ? raw.subCategories
+          : raw?.subCategory
+            ? [raw.subCategory]
+            : [],
+        profileImage: String(raw?.profileImage ?? ""),
+        mainImage: String(raw?.mainImage ?? ""),
+
+        subImages: normalizeSubImages(raw?.subImages) as any,
+        tags: Array.isArray(raw?.tags) ? raw.tags : [],
+        symbolColors: normalizeSymbolColors(raw?.symbolColors) as any,
+
+        summary: String(raw?.summary ?? ""),
+        description: String(raw?.description ?? ""),
+        meta: raw?.meta ?? undefined,
+      };
+
+      const prevObj = prevCache.get(id);
+      const reused = prevObj && creatureEqual(prevObj, nextObj) ? prevObj : nextObj;
+
+      nextCache.set(id, reused);
+      return reused;
+    });
+
+    normalizedCacheRef.current = nextCache;
+    return normalized;
+  }, [data.creatures, defaultRankIdResolved]);
+
+  const [selectedId, setSelectedId] = useState<ID | null>(
+    (creaturesNormalized[0]?.id as ID) || null
   );
 
-  // ✅ 필터
   const [activeMain, setActiveMain] = useState<string>(ALL);
   const [activeSub, setActiveSub] = useState<string>(ALL);
 
-  // ✅ 카테고리 편집
-  const [isEditingCategory, setIsEditingCategory] = useState(false);
-  const [draftCategories, setDraftCategories] = useState<CategoryGroup[]>(categories);
-
-  // ✅ 크리쳐 추가/수정 모달
-  const [editingTarget, setEditingTarget] = useState<"new" | string | null>(null);
-
-  // ✅ 감상 모드 상세 모달
-  const [viewModalId, setViewModalId] = useState<string | null>(null);
+  const [viewModalId, setViewModalId] = useState<ID | null>(null);
   const [viewSubIndex, setViewSubIndex] = useState(0);
 
-  useEffect(() => {
-    setDraftCategories(categories);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<ID | null>(null);
 
-    // 메인 카테고리 유효성 체크 (전체는 항상 유효)
-    if (activeMain !== ALL && !categories.find((c) => c.main === activeMain)) {
-      setActiveMain(ALL);
-      setActiveSub(ALL);
+  // frame settings modal
+  const [isFrameSettingsOpen, setIsFrameSettingsOpen] = useState(false);
+
+  // selectedExtra (compat)
+  const currentSelected = useMemo<FrameDraft>(() => {
+    const raw = (data.settings as any)?.frameSettings?.creatures?.selectedExtra;
+
+    if (raw && (raw.outer || raw.inner)) {
+      return {
+        outer: (raw.outer as FramePresetId) ?? "none",
+        inner: (raw.inner as FramePresetId) ?? "none",
+      };
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data.settings?.creatureCategories]);
 
-  // ✅ 전체 sub 목록(태그 선택용)
-  const allSubs = useMemo(() => {
-    const all = categories.flatMap((c) => c.subs || []);
-    return Array.from(new Set(all));
-  }, [categories]);
+    const presets: FramePresetId[] = raw?.presets ?? [];
+    const first = presets[0] ?? "none";
 
-  // ✅ main -> subs map
-  const mainToSubs = useMemo(() => {
-    const map = new Map<string, string[]>();
-    for (const cg of categories) map.set(cg.main, cg.subs || []);
+    return {
+      outer: isOuterPreset(first) ? first : "none",
+      inner: !isOuterPreset(first) && first !== "none" ? first : "none",
+    };
+  }, [data.settings]);
+
+  const [frameDraft, setFrameDraft] = useState<FrameDraft>(() => currentSelected);
+
+  useEffect(() => {
+    setFrameDraft(currentSelected);
+  }, [currentSelected]);
+
+  const setOuter = useCallback((id: FramePresetId) => {
+    setFrameDraft((prev) => ({ ...prev, outer: id }));
+  }, []);
+
+  const setInner = useCallback((id: FramePresetId) => {
+    setFrameDraft((prev) => ({ ...prev, inner: id }));
+  }, []);
+
+  const saveFrameSettings = useCallback(() => {
+    setData((prev) => {
+      const prevSettings: any = prev.settings ?? {};
+      const prevFrameSettings: any = prevSettings.frameSettings ?? {};
+      const prevCreaturesFS: any = prevFrameSettings.creatures ?? {};
+
+      const isNoneOuter = frameDraft.outer === "none";
+      const isNoneInner = frameDraft.inner === "none";
+
+      const nextSelectedExtra =
+        isNoneOuter && isNoneInner
+          ? undefined
+          : { outer: frameDraft.outer, inner: frameDraft.inner };
+
+      return {
+        ...prev,
+        settings: {
+          ...prevSettings,
+          frameSettings: {
+            ...prevFrameSettings,
+            creatures: {
+              ...prevCreaturesFS,
+              selectedExtra: nextSelectedExtra,
+            },
+          },
+        },
+      };
+    });
+
+    setIsFrameSettingsOpen(false);
+  }, [frameDraft, setData]);
+
+  // categories save handler
+  const handleSaveCategories = useCallback(
+    (nextGroups: CategoryGroup[]) => {
+      setData((prev) => ({
+        ...prev,
+        settings: {
+          ...(prev.settings ?? {}),
+          creatureCategories: toCategoryItems(nextGroups),
+        },
+      }));
+    },
+    [setData]
+  );
+
+  // category modal state
+  const [isEditingCategory, setIsEditingCategory] = useState(false);
+  const [draftCategories, setDraftCategories] = useState<CategoryGroup[]>(() => categories);
+
+  useEffect(() => {
+    if (isEditingCategory) setDraftCategories(categories);
+  }, [isEditingCategory, categories]);
+
+  const saveCategories = useCallback(() => {
+    handleSaveCategories(draftCategories);
+    setIsEditingCategory(false);
+  }, [draftCategories, handleSaveCategories]);
+
+  // maps (main -> subs set)
+  const mainToSubsSet = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const cg of categories) map.set(cg.main, new Set(cg.subs || []));
     return map;
   }, [categories]);
 
-  // ✅ 서브 필터 버튼 목록
-  const subsOfActiveMain = useMemo(() => {
-    if (activeMain === ALL) return [ALL, ...allSubs];
-    return [ALL, ...(mainToSubs.get(activeMain) || [])];
-  }, [activeMain, mainToSubs, allSubs]);
+  // 크리쳐별 subCategories Set 캐시
+  const charSubSet = useMemo(() => {
+    const m = new Map<ID, Set<string>>();
+    for (const c of creaturesNormalized) m.set(c.id, new Set(c.subCategories || []));
+    return m;
+  }, [creaturesNormalized]);
 
-  // ✅ 필터링
   const filtered = useMemo(() => {
+    const activeMainSubsArr =
+      activeMain === ALL ? null : Array.from(mainToSubsSet.get(activeMain) || []);
+
     return creaturesNormalized.filter((c) => {
-      const creatureSubs = c.subCategories || [];
+      const subs = charSubSet.get(c.id) || new Set<string>();
 
       const mainOk =
         activeMain === ALL
           ? true
-          : (mainToSubs.get(activeMain) || []).some((sub) =>
-            creatureSubs.includes(sub)
-          );
+          : activeMainSubsArr
+            ? activeMainSubsArr.some((s) => subs.has(s))
+            : true;
 
-      const subOk = activeSub === ALL ? true : creatureSubs.includes(activeSub);
+      const subOk = activeSub === ALL ? true : subs.has(activeSub);
 
       return mainOk && subOk;
     });
-  }, [creaturesNormalized, activeMain, activeSub, mainToSubs]);
+  }, [creaturesNormalized, activeMain, activeSub, mainToSubsSet, charSubSet]);
 
-  // ✅ 선택 크리쳐가 필터/삭제로 사라졌으면 보정
   useEffect(() => {
     if (!filtered.length) {
       setSelectedId(null);
@@ -133,905 +305,328 @@ export default function Creatures() {
     const stillExists = filtered.some((c) => c.id === selectedId);
     if (!stillExists) setSelectedId(filtered[0]?.id || null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filtered.length, selectedId]);
+  }, [filtered, selectedId]);
 
-  const selected = creaturesNormalized.find((c) => c.id === selectedId) || null;
-  const viewModalChar = creaturesNormalized.find((c) => c.id === viewModalId) || null;
+  const viewModalChar = useMemo(
+    () => creaturesNormalized.find((c) => c.id === viewModalId) || null,
+    [creaturesNormalized, viewModalId]
+  );
 
-  const updateCreatures = (next: Creature[]) =>
-    setData({
-      ...data,
-      creatures: next.map((c) => ({
-        id: c.id,
-        name: c.name,
-        subCategories: c.subCategories || [],
-        profileImage: c.profileImage || "",
-        mainImage: c.mainImage || "",
-        mainImageDesc: c.mainImageDesc || "",
-        subImages: c.subImages || [],
-        tags: c.tags || [],
-        description: c.description || "",
-      })),
-    });
+  const subTagOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const cg of categories) {
+      for (const s of cg.subs || []) {
+        const v = (s || "").trim();
+        if (v) set.add(v);
+      }
+    }
+    return Array.from(set);
+  }, [categories]);
 
-  const openNewModal = () => setEditingTarget("new");
-  const openEditModal = (id: string) => setEditingTarget(id);
+  /** ✅ 저장 시에도 신 스키마로 고정(sanitize) */
+  const updateCreatures = useCallback(
+    (next: CreatureData[]) => {
+      setData((prev) => ({
+        ...prev,
+        creatures: next.map((c) => ({
+          ...c,
+          rankId: (c.rankId || defaultRankIdResolved || ("rank_default" as ID)) as ID,
+          subCategories: c.subCategories || [],
 
-  const upsertCreature = (payload: Creature) => {
-    const exists = creaturesNormalized.some((c) => c.id === payload.id);
-    const next = exists
-      ? creaturesNormalized.map((c) => (c.id === payload.id ? payload : c))
-      : [...creaturesNormalized, payload];
+          subImages: sanitizeSubImages(c.subImages) as any,
+          symbolColors: sanitizeSymbolColors(c.symbolColors) as any,
 
-    updateCreatures(next);
+          tags: c.tags || [],
+          profileImage: c.profileImage || "",
+          mainImage: c.mainImage || "",
+          summary: c.summary || "",
+          description: c.description || "",
+        })),
+      }));
+    },
+    [setData, defaultRankIdResolved]
+  );
+
+  const openDetail = useCallback((id: ID) => {
+    setViewModalId(id);
+    setViewSubIndex(0);
+  }, []);
+
+  const addNewCreature = useCallback(() => {
+    const payload: CreatureData = {
+      id: makeId(),
+      name: "새 크리쳐",
+      rankId: defaultRankIdResolved,
+      subCategories: [],
+      profileImage: "",
+      mainImage: "",
+      subImages: [] as any,
+      tags: [],
+      summary: "",
+      description: "",
+      symbolColors: [] as any,
+      meta: { order: 0 },
+    };
+
+    updateCreatures([...creaturesNormalized, payload]);
     setSelectedId(payload.id);
-  };
+    openDetail(payload.id);
+  }, [creaturesNormalized, updateCreatures, openDetail, defaultRankIdResolved]);
 
-  const deleteCreature = (id: string) => {
-    const next = creaturesNormalized.filter((c) => c.id !== id);
-    updateCreatures(next);
-    setSelectedId(next[0]?.id || null);
-  };
+  const deleteCreature = useCallback(
+    (id: ID) => {
+      const next = creaturesNormalized.filter((c) => c.id !== id);
+      updateCreatures(next);
 
-  // ----------------------------
-  // Category Editor
-  // ----------------------------
-  const saveCategories = () => {
-    setData({
-      ...data,
-      settings: {
-        ...data.settings,
-        creatureCategories: draftCategories,
-      },
-    });
-    setIsEditingCategory(false);
-  };
+      setSelectedId((next[0]?.id as ID) || null);
+      setViewModalId((cur) => (cur === id ? null : cur));
+      setViewSubIndex(0);
+    },
+    [creaturesNormalized, updateCreatures]
+  );
 
-  // ----------------------------
-  // quick toggle for selected (edit panel)
-  // ----------------------------
-  const toggleSelectedSub = (sub: string) => {
-    if (!selected) return;
-    const next = creaturesNormalized.map((c) => {
-      if (c.id !== selected.id) return c;
-      const has = (c.subCategories || []).includes(sub);
-      const subCategories = has
-        ? (c.subCategories || []).filter((x) => x !== sub)
-        : [...(c.subCategories || []), sub];
-      return { ...c, subCategories };
-    });
-    updateCreatures(next);
-  };
+  const patchCreature = useCallback(
+    (id: ID, patch: Partial<CreatureData>) => {
+      const next = creaturesNormalized.map((c) =>
+        c.id === id ? ({ ...c, ...patch } as CreatureData) : c
+      );
+      updateCreatures(next);
+    },
+    [creaturesNormalized, updateCreatures]
+  );
+
+  const stats = useMemo(() => {
+    return {
+      total: creaturesNormalized.length,
+      showing: filtered.length,
+      categories: categories.length,
+    };
+  }, [creaturesNormalized.length, filtered.length, categories.length]);
+
+  const handleSelectCard = useCallback((id: ID) => setSelectedId(id), []);
+  const handleOpenCard = useCallback((id: ID) => openDetail(id), [openDetail]);
+  const handleEditCard = useCallback((id: ID) => openDetail(id), [openDetail]);
+  const handleAskDelete = useCallback((id: ID) => setConfirmDeleteId(id), []);
 
   return (
-    <div className="min-h-screen gyeol-bg text-white">
-      {/* ✅ HERO / HEADER */}
-      <div className="relative overflow-hidden">
-        <div className="relative px-12 py-12">
-          <div className="flex items-end justify-between gap-6">
-            <div>
-              <p className="text-lg text-white/60 mb-2">CHARACTERS</p>
-              <h1 className="text-4xl text-white font-extrabold tracking-tight">
-                크리쳐 소개
-              </h1>
+    <div
+      className={cn(
+        "min-h-[100svh] md:h-[100svh] w-full max-w-full overflow-x-hidden",
+        "gyeol-bg text-white relative",
+        "md:overflow-hidden"
+      )}
+    >
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(255,255,255,0.07),transparent_45%),radial-gradient(circle_at_85%_30%,rgba(99,102,241,0.10),transparent_45%)]" />
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,rgba(0,0,0,0.10),rgba(0,0,0,0.65))]" />
+
+      <div
+        className={cn(
+          "relative z-10",
+          "px-4 sm:px-6 md:px-10 lg:px-12 py-6 md:py-10",
+          "md:h-full flex flex-col min-w-0"
+        )}
+      >
+        {/* TOP BAR (✅ 모바일: 줄바꿈/스크롤 자연스럽게) */}
+        <div className="shrink-0">
+          <div className="flex flex-row items-center md:justify-between gap-3">
+            {/* badges */}
+            <div
+              className={cn(
+                "flex items-center gap-2",
+                "flex-wrap",
+                "max-w-full"
+              )}
+            >
+              {editMode ? <HUDBadge tone="warn">EDIT</HUDBadge> : <HUDBadge>VIEW</HUDBadge>}
             </div>
 
+            {/* actions */}
             {editMode && (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center justify-end gap-2 flex-wrap">
                 <GButton
                   variant="ghost"
-                  icon={<Pencil className="w-4 h-4" />}
-                  text="카테고리 편집"
-                  onClick={() => setIsEditingCategory((v) => !v)}
+                  icon={<SlidersHorizontal className="w-4 h-4" />}
+                  text="프레임 설정"
+                  onClick={() => setIsFrameSettingsOpen(true)}
                 />
                 <GButton
                   variant="primary"
                   icon={<Plus className="w-4 h-4" />}
                   text="크리쳐 추가"
-                  onClick={openNewModal}
+                  onClick={addNewCreature}
                 />
               </div>
             )}
           </div>
+        </div>
 
-          {/* ✅ 필터 바 */}
-          {!isEditingCategory ? (
-            <div className="mt-12 space-y-6">
-              {/* 메인 */}
-              <div className="flex flex-wrap gap-3">
-                <button
-                  onClick={() => {
-                    setActiveMain(ALL);
-                    setActiveSub(ALL);
-                  }}
-                  className={[
-                    "px-5 h-10 rounded-full text-sm font-medium transition-all duration-200",
-                    activeMain === ALL
-                      ? "bg-white/10 text-white border border-white/20 shadow-md"
-                      : "bg-zinc-900 text-zinc-300 border border-zinc-600 hover:bg-zinc-800 hover:text-white",
-                  ].join(" ")}
-                >
-                  전체
-                </button>
-
-                {categories.map((c) => {
-                  const active = c.main === activeMain;
-                  return (
-                    <button
-                      key={c.main}
-                      onClick={() => {
-                        setActiveMain(c.main);
-                        setActiveSub(ALL);
-                      }}
-                      className={[
-                        "px-5 h-10 rounded-full text-sm font-medium transition-all duration-200",
-                        active
-                          ? "bg-white/10 text-white border border-white/20 shadow-md"
-                          : "bg-zinc-900 text-zinc-300 border border-zinc-600 hover:bg-zinc-800 hover:text-white",
-                      ].join(" ")}
-                    >
-                      {c.main}
-                    </button>
-                  );
-                })}
+        {/* HEADER + CATEGORIES */}
+        <HUDPanel className="p-6 mt-4 sm:mt-6 shrink-0 w-full max-w-full min-w-0 overflow-x-hidden">
+          <div className="flex flex-col gap-3 min-w-0">
+            <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-4 min-w-0">
+              <div className="min-w-0">
+                <div className="text-[11px] tracking-[0.26em] text-white/55">CREATURES</div>
+                <div className="mt-2 text-2xl sm:text-3xl font-extrabold tracking-tight">크리쳐 소개</div>
+                <div className="mt-2 text-sm text-white/60">
+                  세계관의 크리쳐들을 살펴보세요.
+                </div>
               </div>
 
-              {/* 서브 */}
-              <div className="flex flex-wrap gap-2">
-                {subsOfActiveMain.map((s) => {
-                  const active = s === activeSub;
-                  return (
-                    <button
-                      key={s}
-                      onClick={() => setActiveSub(s)}
-                      className={[
-                        "px-4 h-8 rounded-full text-xs transition-all duration-200",
-                        active
-                          ? "bg-zinc-700 text-white"
-                          : "bg-zinc-900 text-zinc-400 border border-zinc-800 hover:bg-zinc-800 hover:text-white",
-                      ].join(" ")}
-                    >
-                      {s}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          ) : (
-            <div className="mt-14 rounded-2xl border border-zinc-800 bg-zinc-900/80 backdrop-blur p-6 space-y-6 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
-              <div className="flex items-center justify-between">
-                <p className="text-xl font-semibold text-white tracking-tight">
-                  카테고리 편집
-                </p>
-
-                <div className="flex gap-2">
+              {editMode && (
+                <div className="flex items-center gap-2 shrink-0">
                   <GButton
                     variant="ghost"
-                    text="취소"
-                    onClick={() => {
-                      setDraftCategories(categories);
-                      setIsEditingCategory(false);
-                    }}
+                    icon={<Pencil className="w-4 h-4" />}
+                    text="카테고리 편집"
+                    onClick={() => setIsEditingCategory(true)}
                   />
-                  <GButton variant="primary" text="저장" onClick={saveCategories} />
-                </div>
-              </div>
-
-              <div className="space-y-6">
-                {draftCategories.map((cg, idx) => (
-                  <div
-                    key={idx}
-                    className="rounded-2xl border border-zinc-800 bg-zinc-950/70 p-6 space-y-4"
-                  >
-                    <div className="flex items-center gap-3">
-                      <input
-                        value={cg.main}
-                        onChange={(e) => {
-                          const next = [...draftCategories];
-                          next[idx] = { ...next[idx], main: e.target.value };
-                          setDraftCategories(next);
-                        }}
-                        className="h-10 px-4 rounded-xl bg-zinc-950 border border-zinc-800 text-white w-56
-                          focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
-                        placeholder="메인 카테고리"
-                      />
-
-                      <GButton
-                        variant="danger"
-                        text="삭제"
-                        onClick={() => {
-                          const next = draftCategories.filter((_, i) => i !== idx);
-                          setDraftCategories(next);
-                        }}
-                      />
-                    </div>
-
-                    <div className="space-y-3">
-                      {cg.subs.map((s, sidx) => (
-                        <div key={sidx} className="flex items-center gap-3">
-                          <input
-                            value={s}
-                            onChange={(e) => {
-                              const next = [...draftCategories];
-                              const subs = [...next[idx].subs];
-                              subs[sidx] = e.target.value;
-                              next[idx] = { ...next[idx], subs };
-                              setDraftCategories(next);
-                            }}
-                            className="h-9 px-4 rounded-xl bg-zinc-950 border border-zinc-800 text-white w-72
-                              focus:outline-none focus:ring-2 focus:ring-white/20 transition-all"
-                            placeholder="서브 카테고리"
-                          />
-
-                          <GButton
-                            variant="ghost"
-                            text="제거"
-                            onClick={() => {
-                              const next = [...draftCategories];
-                              next[idx] = {
-                                ...next[idx],
-                                subs: next[idx].subs.filter((_, i) => i !== sidx),
-                              };
-                              setDraftCategories(next);
-                            }}
-                          />
-                        </div>
-                      ))}
-
-                      <button
-                        onClick={() => {
-                          const next = [...draftCategories];
-                          next[idx] = { ...next[idx], subs: [...next[idx].subs, ""] };
-                          setDraftCategories(next);
-                        }}
-                        className="h-9 px-4 rounded-xl border border-dashed border-zinc-700 text-zinc-400
-                          hover:bg-zinc-800 hover:text-white transition-all"
-                      >
-                        + 서브 추가
-                      </button>
-                    </div>
-                  </div>
-                ))}
-
-                <button
-                  onClick={() =>
-                    setDraftCategories([...draftCategories, { main: "", subs: [""] }])
-                  }
-                  className="h-11 px-6 rounded-2xl border border-dashed border-zinc-700
-                    text-zinc-400 hover:bg-zinc-800 hover:text-white transition-all duration-200"
-                >
-                  + 메인 카테고리 추가
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
-      </div>
-
-      {/* ✅ GRID */}
-      <div className="px-14 py-10 min-h-screen">
-        {filtered.length === 0 ? (
-          <div className="py-32 text-center text-zinc-500 text-sm tracking-wide">
-            해당 카테고리에 크리쳐가 없습니다.
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-7 gap-6">
-            {filtered.map((c) => (
-              <CreatureGridCard
-                key={c.id}
-                id={c.id}
-                name={c.name}
-                subCategories={c.subCategories}
-                image={c.profileImage}
-                selected={c.id === selectedId}
-                onClick={() => setSelectedId(c.id)}
-                onOpen={() => !editMode && setViewModalId(c.id)}
-                editMode={editMode}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* ✅ 선택 크리쳐 편집 패널 */}
-        {editMode && selected && (
-          <div className="mt-14 grid grid-cols-1 lg:grid-cols-3 gap-8">
-            <div className="lg:col-span-2 rounded-3xl border border-zinc-800 bg-zinc-900/70 backdrop-blur p-8 space-y-8 shadow-[0_0_0_1px_rgba(255,255,255,0.02)]">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="text-xs text-zinc-500 uppercase tracking-wider">
-                    선택됨
-                  </p>
-                  <p className="text-2xl font-semibold text-white tracking-tight mt-1">
-                    {selected.name}
-                  </p>
-                </div>
-
-                <GButton
-                  variant="dark"
-                  text="상세 편집"
-                  onClick={() => openEditModal(selected.id)}
-                />
-              </div>
-
-              <div>
-                <p className="text-xs text-zinc-500 mb-2">서브 카테고리(복수)</p>
-
-                <div className="flex flex-wrap gap-2">
-                  {allSubs.map((s) => {
-                    const active = (selected.subCategories || []).includes(s);
-                    return (
-                      <button
-                        type="button"
-                        key={s}
-                        onClick={() => toggleSelectedSub(s)}
-                        className={[
-                          "px-3 h-8 rounded-full text-xs border transition",
-                          active
-                            ? "bg-white text-black border-white"
-                            : "bg-zinc-950 text-zinc-300 border-zinc-800 hover:bg-zinc-900",
-                        ].join(" ")}
-                      >
-                        {s}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {(selected.subCategories || []).map((t) => (
-                    <span
-                      key={t}
-                      className="inline-flex items-center gap-2 px-3 h-8 rounded-full bg-white/10 text-white text-xs border border-white/10"
-                    >
-                      {t}
-                      <button
-                        type="button"
-                        onClick={() => toggleSelectedSub(t)}
-                        className="opacity-70 hover:opacity-100"
-                      >
-                        <X className="w-3 h-3" />
-                      </button>
-                    </span>
-                  ))}
-                  {(selected.subCategories || []).length === 0 && (
-                    <p className="text-xs text-zinc-500">
-                      서브 카테고리를 선택해주세요.
-                    </p>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                <p className="text-xs text-zinc-500 mb-2">설명</p>
-                <textarea
-                  value={selected.description}
-                  onChange={(e) => {
-                    const next = creaturesNormalized.map((x) =>
-                      x.id === selected.id
-                        ? { ...x, description: e.target.value }
-                        : x
-                    );
-                    updateCreatures(next);
-                  }}
-                  className="w-full min-h-28 p-4 rounded-xl bg-zinc-950 border border-zinc-800 text-white resize-none
-                    focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-                  placeholder="크리쳐 설명"
-                />
-              </div>
-            </div>
-
-            <div className="rounded-3xl border border-zinc-800 bg-zinc-900/70 backdrop-blur p-8 space-y-4">
-              <p className="text-lg font-semibold text-white">빠른 작업</p>
-
-              <GButton
-                variant="ghost"
-                text="이미지 / 서브 상세 편집"
-                onClick={() => openEditModal(selected.id)}
-                className="w-full"
-              />
-
-              <GButton
-                variant="danger"
-                text="크리쳐 삭제"
-                onClick={() => deleteCreature(selected.id)}
-                disabled={creaturesNormalized.length <= 1}
-                className="w-full"
-              />
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* ✅ 감상 모드 상세 모달(더블클릭) */}
-      <Modal
-        open={!editMode && !!viewModalChar}
-        onClose={() => {
-          setViewModalId(null);
-          setViewSubIndex(0);
-        }}
-        title={viewModalChar ? viewModalChar.name : "상세"}
-        maxWidthClassName="max-w-3xl"
-        footer={
-          <div className="flex justify-end">
-            <GButton
-              variant="dark"
-              text="닫기"
-              onClick={() => {
-                setViewModalId(null);
-                setViewSubIndex(0);
-              }}
-            />
-          </div>
-        }
-      >
-        {viewModalChar && (
-          <ViewCreatureContent
-            char={viewModalChar}
-            viewSubIndex={viewSubIndex}
-            setViewSubIndex={setViewSubIndex}
-          />
-        )}
-      </Modal>
-
-      {/* ✅ 추가/수정 모달 (editMode) */}
-      {editMode && editingTarget && (
-        <CreatureEditModal
-          key={editingTarget}
-          target={editingTarget}
-          allSubs={allSubs}
-          Creatures={creaturesNormalized}
-          onClose={() => setEditingTarget(null)}
-          onSave={(c) => {
-            upsertCreature(c);
-            setEditingTarget(null);
-          }}
-          onDelete={(id) => {
-            deleteCreature(id);
-            setEditingTarget(null);
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-/* -------------------------------------------
- * Grid Card (Hook 안전: 컴포넌트 분리)
- * ------------------------------------------- */
-function CreatureGridCard(props: {
-  id: string;
-  name: string;
-  subCategories: string[];
-  image: string;
-  selected: boolean;
-  editMode: boolean;
-  onClick: () => void;
-  onOpen: () => void;
-}) {
-  const { name, subCategories, image, selected, editMode, onClick, onOpen } =
-    props;
-
-  const resolved = useResolvedImage(image);
-
-  return (
-    <button
-      onClick={onClick}
-      onDoubleClick={() => !editMode && onOpen()}
-      className={[
-        "group relative aspect-square overflow-hidden rounded-2xl",
-        "transition-all duration-300 hover:shadow-xl shadow-sm",
-        selected ? "scale-[1.02]" : "hover:scale-[1.02]",
-      ].join(" ")}
-      title={editMode ? "클릭: 선택 / (편집은 아래 패널)" : "더블클릭: 상세 보기"}
-    >
-      <div className="absolute inset-0 bg-zinc-900">
-        {resolved ? (
-          <img
-            src={resolved}
-            alt={name}
-            className={[
-              "h-full w-full object-cover transition-all duration-500 will-change-transform",
-              selected
-                ? "scale-110 brightness-100 saturate-100 grayscale-0"
-                : "grayscale brightness-75 contrast-105 group-hover:grayscale-0 group-hover:brightness-90 group-hover:scale-105",
-            ].join(" ")}
-          />
-        ) : (
-          <div className="h-full w-full flex items-center justify-center text-xs text-zinc-500">
-            이미지 없음
-          </div>
-        )}
-      </div>
-
-      <div className="absolute inset-x-0 bottom-0 p-4 bg-gradient-to-t from-black/80 to-transparent">
-        <div className="text-white text-sm font-semibold tracking-tight">
-          {name}
-        </div>
-        <div className="text-zinc-400 text-[11px] mt-1">
-          {(subCategories || []).join(", ")}
-        </div>
-      </div>
-
-      {selected && (
-        <div className="absolute inset-0 ring-2 ring-white/20 pointer-events-none" />
-      )}
-    </button>
-  );
-}
-
-/* -------------------------------------------
- * View Content (감상 모달 내부)
- * ------------------------------------------- */
-function ViewCreatureContent(props: {
-  char: Creature;
-  viewSubIndex: number;
-  setViewSubIndex: React.Dispatch<React.SetStateAction<number>>;
-}) {
-  const { char, viewSubIndex, setViewSubIndex } = props;
-
-  const main = useResolvedImage(char.mainImage || "");
-  const sub = useResolvedImage(char.subImages?.[viewSubIndex]?.image || "");
-
-  return (
-    <div className="space-y-6">
-      {/* Main */}
-      <div className="space-y-2 text-black">
-        <p className="text-sm font-semibold">메인 이미지</p>
-        <div className="aspect-video rounded-xl border border-border overflow-hidden bg-white/10">
-          {main ? (
-            <img
-              src={main}
-              className="w-full h-full object-contain"
-              alt="main"
-            />
-          ) : (
-            <div className="w-full h-full flex items-center justify-center text-muted-foreground">
-              이미지 없음
-            </div>
-          )}
-        </div>
-        {!!char.mainImageDesc && (
-          <p className="text-sm text-muted-foreground">{char.mainImageDesc}</p>
-        )}
-      </div>
-
-      {!!char.description && (
-        <div>
-          <p className="text-sm font-semibold mb-2">설명</p>
-          <p className="text-sm text-muted-foreground leading-relaxed whitespace-pre-wrap">
-            {char.description}
-          </p>
-        </div>
-      )}
-
-      {/* Subs */}
-      {char.subImages?.length > 0 && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <p className="text-sm font-semibold">서브 이미지</p>
-            <p className="text-xs text-muted-foreground">
-              {viewSubIndex + 1} / {char.subImages.length}
-            </p>
-          </div>
-
-          <div className="flex items-center gap-3">
-            <GButton
-              variant="default"
-              size="icon"
-              icon={<ChevronLeft className="w-5 h-5" />}
-              onClick={() =>
-                setViewSubIndex(
-                  (p) => (p - 1 + char.subImages.length) % char.subImages.length
-                )
-              }
-              title="이전"
-            />
-
-            <div className="flex-1 aspect-video rounded-xl border border-border overflow-hidden bg-secondary/10">
-              {sub ? (
-                <img
-                  src={sub}
-                  className="w-full h-full object-contain"
-                  alt="sub"
-                />
-              ) : (
-                <div className="w-full h-full flex items-center justify-center text-muted-foreground">
-                  이미지 없음
                 </div>
               )}
             </div>
 
-            <GButton
-              variant="default"
-              size="icon"
-              icon={<ChevronRight className="w-5 h-5" />}
-              onClick={() => setViewSubIndex((p) => (p + 1) % char.subImages.length)}
-              title="다음"
-            />
-          </div>
-
-          {!!char.subImages[viewSubIndex]?.description && (
-            <p className="text-sm text-muted-foreground">
-              {char.subImages[viewSubIndex].description}
-            </p>
-          )}
-
-          <div className="flex gap-2 overflow-x-auto pb-2">
-            {char.subImages.map((s, idx) => (
-              <SubThumb
-                key={idx}
-                image={s.image}
-                active={idx === viewSubIndex}
-                onClick={() => setViewSubIndex(idx)}
-                alt={`thumb-${idx}`}
+            <div className="mt-1 w-full max-w-full min-w-0">
+              <EntityCategoryBar
+                categories={categories}
+                activeMain={activeMain}
+                activeSub={activeSub}
+                setActiveMain={setActiveMain}
+                setActiveSub={setActiveSub}
               />
-            ))}
+            </div>
           </div>
-        </div>
-      )}
-    </div>
-  );
-}
+        </HUDPanel>
 
-/* -------------------------------------------
- * Edit Modal (Modal + GButton 통일)
- * ------------------------------------------- */
-function CreatureEditModal(props: {
-  target: "new" | string;
-  allSubs: string[];
-  Creatures: Creature[];
-  onClose: () => void;
-  onSave: (c: Creature) => void;
-  onDelete: (id: string) => void;
-}) {
-  const { target, allSubs, Creatures, onClose, onSave, onDelete } = props;
-
-  const original =
-    target === "new" ? null : Creatures.find((c) => c.id === target) || null;
-
-  const [draft, setDraft] = useState<Creature>(() => {
-    if (original) return original;
-    return {
-      id: Date.now().toString(),
-      name: "새 크리쳐",
-      subCategories: [],
-      profileImage: "",
-      mainImage: "",
-      mainImageDesc: "",
-      subImages: [],
-      tags: [],
-      description: "",
-    };
-  });
-
-  const toggleSub = (s: string) => {
-    setDraft((d) => {
-      const has = (d.subCategories || []).includes(s);
-      const next = has
-        ? (d.subCategories || []).filter((x) => x !== s)
-        : [...(d.subCategories || []), s];
-      return { ...d, subCategories: next };
-    });
-  };
-
-  const addSubImage = () =>
-    setDraft((d) => ({
-      ...d,
-      subImages: [...d.subImages, { image: "", description: "" }],
-    }));
-
-  const updateSubImage = (idx: number, patch: Partial<SubImage>) =>
-    setDraft((d) => {
-      const next = [...d.subImages];
-      next[idx] = { ...next[idx], ...patch };
-      return { ...d, subImages: next };
-    });
-
-  const removeSubImage = (idx: number) =>
-    setDraft((d) => ({
-      ...d,
-      subImages: d.subImages.filter((_, i) => i !== idx),
-    }));
-
-  return (
-    <Modal
-      open
-      onClose={onClose}
-      title={target === "new" ? "크리쳐 추가" : "크리쳐 수정"}
-      maxWidthClassName="max-w-3xl"
-      footer={
-        <div className="flex items-center gap-2 w-full">
-          <GButton
-            variant="dark"
-            text="저장"
-            onClick={() => onSave(draft)}
-            className="flex-1"
-          />
-          {target !== "new" && (
-            <GButton
-              variant="danger"
-              icon={<Trash2 className="w-4 h-4" />}
-              text="삭제"
-              onClick={() => onDelete(draft.id)}
-            />
-          )}
-        </div>
-      }
-    >
-      <div className="space-y-8 text-black">
-        {/* 기본 */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          <div>
-            <p className="text-sm font-semibold mb-2">이름</p>
-            <input
-              value={draft.name}
-              onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-              className="w-full h-10 px-3 rounded-xl border border-border bg-background"
-            />
-          </div>
-        </div>
-
-        {/* 서브 태그 */}
-        <div>
-          <p className="text-sm font-semibold mb-2">서브 카테고리 (복수 선택)</p>
-          <div className="flex flex-wrap gap-2">
-            {allSubs.map((s) => {
-              const active = (draft.subCategories || []).includes(s);
-              return (
-                <button
-                  type="button"
-                  key={s}
-                  onClick={() => toggleSub(s)}
-                  className={[
-                    "px-3 h-8 rounded-full text-xs border transition",
-                    active
-                      ? "bg-foreground text-background border-foreground"
-                      : "bg-zinc-950 text-zinc-300 border-zinc-800 hover:bg-zinc-900",
-                  ].join(" ")}
-                >
-                  {s}
-                </button>
-              );
-            })}
-          </div>
-          <div className="mt-3 flex flex-wrap gap-2">
-            {(draft.subCategories || []).length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                서브 카테고리를 1개 이상 선택해주세요.
-              </p>
-            ) : (
-              (draft.subCategories || []).map((t) => (
-                <span
-                  key={t}
-                  className="inline-flex items-center gap-2 px-3 h-8 rounded-full bg-foreground/10 text-foreground text-xs border border-foreground/15"
-                >
-                  {t}
-                  <button
-                    type="button"
-                    onClick={() => toggleSub(t)}
-                    className="opacity-70 hover:opacity-100"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </span>
-              ))
-            )}
-          </div>
-        </div>
-
-        <div>
-          <p className="text-sm font-semibold mb-2">크리쳐 설명</p>
-          <textarea
-            value={draft.description}
-            onChange={(e) =>
-              setDraft((d) => ({ ...d, description: e.target.value }))
-            }
-            className="w-full min-h-24 p-3 rounded-xl border border-border bg-background resize-none"
-            placeholder="세계관/성격/능력 등"
-          />
-        </div>
-
-        {/* 프로필 */}
-        <div className="rounded-2xl border border-border bg-secondary/30 p-5 space-y-3">
-          <p className="font-semibold">프로필 이미지</p>
-          <ImageUpload
-            value={draft.profileImage}
-            onChange={(v) => setDraft((d) => ({ ...d, profileImage: v }))}
-          />
-        </div>
-
-        {/* 메인 */}
-        <div className="rounded-2xl border border-border bg-secondary/30 p-5 space-y-3">
-          <p className="font-semibold">메인 이미지</p>
-          <ImageUpload
-            value={draft.mainImage}
-            onChange={(v) => setDraft((d) => ({ ...d, mainImage: v }))}
-          />
-          <textarea
-            value={draft.mainImageDesc || ""}
-            onChange={(e) =>
-              setDraft((d) => ({ ...d, mainImageDesc: e.target.value }))
-            }
-            className="w-full min-h-20 p-3 rounded-xl border border-border bg-background resize-none"
-            placeholder="메인 이미지 설명"
-          />
-        </div>
-
-        {/* 서브 */}
-        <div className="rounded-2xl border border-border bg-secondary/30 p-5 space-y-4">
-          <div className="flex items-center justify-between">
-            <p className="font-semibold">서브 이미지</p>
-            <GButton
-              variant="dark"
-              icon={<Plus className="w-4 h-4" />}
-              text="추가"
-              onClick={addSubImage}
-            />
-          </div>
-
-          {draft.subImages.length === 0 ? (
-            <p className="text-sm text-muted-foreground">서브 이미지를 추가해주세요.</p>
-          ) : (
-            <div className="space-y-6">
-              {draft.subImages.map((s, idx) => (
-                <div
-                  key={idx}
-                  className="rounded-xl border border-border bg-background/40 p-4 space-y-3"
-                >
-                  <div className="flex items-center justify-between">
-                    <p className="text-sm font-semibold">서브 #{idx + 1}</p>
-                    <GButton
-                      variant="danger"
-                      text="삭제"
-                      onClick={() => removeSubImage(idx)}
-                    />
+        {/* CONTENT (✅ 여기만 세로 스크롤) */}
+        <div className="mt-4 flex-1 min-h-0">
+          <div className="min-h-0 md:h-full md:overflow-y-auto md:overscroll-contain scroll-dark pr-1">
+            <div className="pb-6">
+              <HUDPanel className="p-6">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  <div>
+                    <div className="text-[11px] tracking-[0.26em] text-white/55">GRID</div>
+                    <div className="mt-1 text-sm text-white/60">선택 / 상세 열기</div>
                   </div>
 
-                  <ImageUpload
-                    value={s.image}
-                    onChange={(v) => updateSubImage(idx, { image: v })}
-                  />
-                  <textarea
-                    value={s.description}
-                    onChange={(e) =>
-                      updateSubImage(idx, { description: e.target.value })
-                    }
-                    className="w-full min-h-20 p-3 rounded-xl border border-border bg-background resize-none"
-                    placeholder="서브 이미지 설명"
-                  />
+                  <div className="flex items-center gap-2">
+                    <HUDBadge>{activeMain}</HUDBadge>
+                    <HUDBadge>{activeSub}</HUDBadge>
+                  </div>
                 </div>
-              ))}
+
+                <div className="mt-5 sm:mt-6">
+                  {filtered.length === 0 ? (
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-6 sm:p-8 text-center">
+                      <div className="text-sm text-white/55">해당 카테고리에 크리쳐가 없습니다.</div>
+                      {editMode && (
+                        <div className="mt-4 flex justify-center">
+                          <GButton
+                            variant="neutral"
+                            icon={<Plus className="w-4 h-4" />}
+                            text="새 크리쳐 추가"
+                            onClick={addNewCreature}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div
+                      className={cn(
+                        // ✅ 모바일 2열 스타트 (카드가 너무 커보이면 2열 추천)
+                        "grid gap-4 sm:gap-5 md:gap-6",
+                        "grid-cols-2",
+                        "sm:grid-cols-3",
+                        "md:grid-cols-4",
+                        "lg:grid-cols-5",
+                        "xl:grid-cols-7"
+                      )}
+                    >
+                      {filtered.map((c) => (
+                        <EntityGridCard
+                          key={c.id}
+                          id={c.id}
+                          name={c.name}
+                          subCategories={c.subCategories}
+                          image={c.profileImage}
+                          symbolColors={c.symbolColors}
+                          selected={c.id === selectedId}
+                          editMode={editMode}
+                          rankId={c.rankId as ID}
+                          defaultRankId={defaultRankIdResolved}
+                          frameSettings={frameSettingsCreatures}
+                          onSelect={handleSelectCard}
+                          onOpen={handleOpenCard}
+                          onEdit={handleEditCard}
+                          onDelete={handleAskDelete}
+                        />
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </HUDPanel>
+
+              <div className="pointer-events-none mt-4 opacity-[0.10] h-8 rounded-2xl bg-[linear-gradient(rgba(255,255,255,0.18)_1px,transparent_1px)] bg-[length:100%_3px]" />
             </div>
-          )}
+          </div>
         </div>
       </div>
-    </Modal>
-  );
-}
 
-
-function SubThumb(props: {
-  image: string;
-  alt?: string;
-  active: boolean;
-  onClick: () => void;
-}) {
-  const { image, active, onClick, alt = "thumb" } = props;
-  const thumb = useResolvedImage(image || "");
-
-  return (
-    <button
-      onClick={onClick}
-      className={[
-        "w-14 h-14 rounded-xl overflow-hidden border-2 flex-shrink-0 transition",
-        active ? "border-foreground" : "border-border hover:border-muted-foreground",
-      ].join(" ")}
-    >
-      {thumb ? (
-        <img src={thumb} className="w-full h-full object-cover" alt={alt} />
-      ) : (
-        <div className="w-full h-full bg-secondary" />
+      {/* Category edit modal */}
+      {editMode && isEditingCategory && (
+        <CategoryGroupEditModal
+          open
+          title="카테고리 편집"
+          draft={draftCategories}
+          setDraft={setDraftCategories}
+          onClose={() => {
+            setDraftCategories(categories); // ✅ 원복
+            setIsEditingCategory(false);
+          }}
+          onSave={saveCategories}
+          mainLabel="메인 카테고리"
+          subLabel="서브 카테고리"
+        />
       )}
-    </button>
+
+      {/* Frame settings modal (✅ 모바일 반응형 강화) */}
+      <EntityFrameSettingsModal
+        open={isFrameSettingsOpen}
+        value={frameDraft}
+        onChange={setFrameDraft}
+        onClose={() => setIsFrameSettingsOpen(false)}
+        onSave={saveFrameSettings}
+      />
+
+      {/* Detail */}
+      {viewModalChar && (
+        <EntityDetailFullscreen
+          entity={viewModalChar}
+          viewSubIndex={viewSubIndex}
+          setViewSubIndex={setViewSubIndex}
+          onClose={() => {
+            setViewModalId(null);
+            setViewSubIndex(0);
+          }}
+          editable={editMode}
+          onDelete={() => setConfirmDeleteId(viewModalChar.id)}
+          onPatch={(p) => patchCreature(viewModalChar.id, p as any)}
+          tagOptions={subTagOptions}
+        />
+      )}
+
+      <ConfirmModal
+        open={!!confirmDeleteId}
+        title="크리쳐 삭제"
+        description="정말 크리쳐를 삭제하시겠습니까? 삭제 후 되돌릴 수 없습니다."
+        confirmText="삭제"
+        cancelText="취소"
+        danger
+        onClose={() => setConfirmDeleteId(null)}
+        onConfirm={() => {
+          if (!confirmDeleteId) return;
+          deleteCreature(confirmDeleteId);
+          setConfirmDeleteId(null);
+        }}
+      />
+    </div>
   );
 }

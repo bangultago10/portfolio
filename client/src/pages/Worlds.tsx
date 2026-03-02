@@ -1,392 +1,463 @@
-import ImageUpload from "@/components/ImageUpload";
+import React, { useCallback, useEffect, useMemo, useState, useDeferredValue } from "react";
+import { useLocation } from "wouter";
+import { ChevronLeft, ChevronRight, Plus, Trash2, Edit2, Unlink } from "lucide-react";
+
 import GButton from "@/components/ui/gyeol-button";
-import Modal from "@/components/ui/modal";
-import { usePortfolioContext } from "@/contexts/PortfolioContext";
-import {
-  ChevronLeft,
-  ChevronRight,
-  Plus,
-  Trash2,
-  Edit2,
-} from "lucide-react";
-import { useMemo, useState, useEffect } from "react";
-import { useResolvedImage } from "@/hooks/useResolvedImage";
+import { HUDPanel, HUDBadge } from "@/components/ui/hud";
 import WorldThumbCard from "@/components/worlds/WorldThumbCard";
-import AddItemCard from "@/components/worlds/AddItemCard";
+
+import AddWorldModal from "@/components/worlds/modals/AddWorldModal";
+import EditWorldMediaModal from "@/components/worlds/modals/EditWorldMediaModal";
+import AddWorldItemModal from "@/components/worlds/modals/AddWorldItemModal";
+
+import { usePortfolioContext } from "@/contexts/PortfolioContext";
+import type {
+  ID,
+  WorldCharacterRef,
+  WorldCreatureRef,
+  WorldData,
+  CharacterData,
+  CreatureData,
+} from "@/types";
+
+import { DEFAULT_WORLD_PROPER_NOUN_KINDS } from "@/lib/defaultData";
+import { cn } from "@/lib/utils";
+
+import EntityDetailFullscreen from "@/components/entities/detail/EntityDetailFullscreen";
+import { useResolvedImage } from "@/hooks/useResolvedImage";
+
+function makeId(): ID {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID() as ID;
+  }
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}` as ID;
+}
+
+type AddTab = "character" | "creature";
 
 export default function Worlds() {
   const { data, setData, editMode } = usePortfolioContext();
+  const worlds = data.worlds ?? [];
+
+  // navigation
+  const [_, setLocation] = useLocation();
 
   const [currentWorldIndex, setCurrentWorldIndex] = useState(0);
-  const [currentDisplayIndex, setCurrentDisplayIndex] = useState(0);
+  const currentWorld = worlds[currentWorldIndex] ?? null;
 
+  // ✅ background resolve (img: 키 포함 대응)
+  const resolvedWorldBg = useResolvedImage(currentWorld?.backgroundImage ?? "");
+
+  // ✅ entity lookup maps (O(1))
+  const characterById = useMemo(() => {
+    const m = new Map<ID, CharacterData>();
+    (data.characters ?? []).forEach((c) => m.set(c.id, c));
+    return m;
+  }, [data.characters]);
+
+  const creatureById = useMemo(() => {
+    const m = new Map<ID, CreatureData>();
+    (data.creatures ?? []).forEach((c) => m.set(c.id, c));
+    return m;
+  }, [data.creatures]);
+
+  // modals
   const [isAddingWorld, setIsAddingWorld] = useState(false);
   const [isAddingItem, setIsAddingItem] = useState(false);
 
-  // ✅ Add World fields
+  // Add World draft
   const [newWorldName, setNewWorldName] = useState("");
   const [newWorldDesc, setNewWorldDesc] = useState("");
   const [newWorldIconImage, setNewWorldIconImage] = useState("");
   const [newWorldBackgroundImage, setNewWorldBackgroundImage] = useState("");
 
-  // ✅ Background edit (draft)
+  // Edit media draft
   const [isEditingBackground, setIsEditingBackground] = useState(false);
   const [backgroundUrl, setBackgroundUrl] = useState("");
   const [worldIconUrl, setWorldIconUrl] = useState("");
 
-  // ✅ Add Item modal state
-  const [addTab, setAddTab] = useState<"character" | "creature">("character");
+  // Add item modal
+  const [addTab, setAddTab] = useState<AddTab>("character");
   const [search, setSearch] = useState("");
+  const deferredSearch = useDeferredValue(search);
 
-  const worlds = data.worlds || [];
-  const currentWorld = worlds[currentWorldIndex];
+  const [detailOpen, setDetailOpen] = useState<{ type: AddTab; id: ID } | null>(null);
+  const [detailSubIndex, setDetailSubIndex] = useState(0);
 
-  const displayItems = useMemo(() => {
-    const w = currentWorld;
-    if (!w) return [];
-    return [
-      ...(w?.worldCharacters?.map((ref: any) => ({
-        type: "character" as const,
-        id: ref.id,
-        characterId: ref.characterId,
-        data: data.characters.find((c) => c.id === ref.characterId),
-      })) || []),
-      ...(w?.worldCreatures?.map((ref: any) => ({
-        type: "creature" as const,
-        id: ref.id,
-        creatureId: ref.creatureId,
-        data: data.creatures.find((c) => c.id === ref.creatureId),
-      })) || []),
-    ].filter((it) => !!it.data); // 안전: 없는 참조 제거
-  }, [currentWorld, data.characters, data.creatures]);
-
-  // ✅ display index 안전장치
-  useEffect(() => {
-    if (displayItems.length === 0) {
-      setCurrentDisplayIndex(0);
-      return;
-    }
-    setCurrentDisplayIndex((prev) =>
-      Math.min(Math.max(prev, 0), displayItems.length - 1)
-    );
-  }, [displayItems.length]);
+  // ✅ edit drafts (avoid setData on every keystroke)
+  const [nameDraft, setNameDraft] = useState("");
+  const [descDraft, setDescDraft] = useState("");
 
   useEffect(() => {
     if (!worlds.length) return;
     setCurrentWorldIndex((i) => Math.min(Math.max(i, 0), worlds.length - 1));
   }, [worlds.length]);
 
-  const handleUpdateWorld = (updates: any) => {
-    const nextWorlds = [...(data.worlds || [])];
-    const target = nextWorlds[currentWorldIndex];
-    if (!target) return;
+  const updateWorldAtIndex = useCallback(
+    (index: number, patch: Partial<WorldData>) => {
+      setData((prev) => {
+        const nextWorlds = [...(prev.worlds ?? [])];
+        const target = nextWorlds[index];
+        if (!target) return prev;
+        nextWorlds[index] = { ...target, ...patch };
+        return { ...prev, worlds: nextWorlds };
+      });
+    },
+    [setData]
+  );
 
-    nextWorlds[currentWorldIndex] = { ...target, ...updates };
-    setData({ ...data, worlds: nextWorlds });
-  };
+  // ✅ keep drafts in sync when switching worlds
+  useEffect(() => {
+    if (!currentWorld) return;
+    setNameDraft(currentWorld.name ?? "");
+    setDescDraft(currentWorld.description ?? "");
+  }, [currentWorld?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const openBackgroundModal = () => {
-    setBackgroundUrl(currentWorld?.backgroundImage || "");
-    setWorldIconUrl(currentWorld?.iconImage || "");
+  // ✅ debounce patch (name/desc)
+  useEffect(() => {
+    if (!editMode || !currentWorld) return;
+
+    const t = window.setTimeout(() => {
+      const nextName = nameDraft ?? "";
+      if ((currentWorld.name ?? "") !== nextName) {
+        updateWorldAtIndex(currentWorldIndex, { name: nextName });
+      }
+    }, 250);
+
+    return () => window.clearTimeout(t);
+  }, [nameDraft, editMode, currentWorld, currentWorldIndex, updateWorldAtIndex]);
+
+  useEffect(() => {
+    if (!editMode || !currentWorld) return;
+
+    const t = window.setTimeout(() => {
+      const nextDesc = descDraft ?? "";
+      if ((currentWorld.description ?? "") !== nextDesc) {
+        updateWorldAtIndex(currentWorldIndex, { description: nextDesc });
+      }
+    }, 250);
+
+    return () => window.clearTimeout(t);
+  }, [descDraft, editMode, currentWorld, currentWorldIndex, updateWorldAtIndex]);
+
+  const openBackgroundModal = useCallback(() => {
+    setBackgroundUrl(currentWorld?.backgroundImage ?? "");
+    setWorldIconUrl(currentWorld?.iconImage ?? "");
     setIsEditingBackground(true);
-  };
+  }, [currentWorld]);
 
-  const closeBackgroundModal = () => {
+  const closeBackgroundModal = useCallback(() => {
     setIsEditingBackground(false);
     setBackgroundUrl("");
     setWorldIconUrl("");
-  };
+  }, []);
 
-  const saveBackground = () => {
-    handleUpdateWorld({
+  const saveBackground = useCallback(() => {
+    if (!currentWorld) return;
+    updateWorldAtIndex(currentWorldIndex, {
       backgroundImage: backgroundUrl,
       iconImage: worldIconUrl,
     });
     closeBackgroundModal();
-  };
+  }, [
+    currentWorld,
+    currentWorldIndex,
+    backgroundUrl,
+    worldIconUrl,
+    updateWorldAtIndex,
+    closeBackgroundModal,
+  ]);
 
-  const handleAddWorld = () => {
-    if (!newWorldName.trim()) return;
-
-    const newWorld: any = {
-      id: Date.now().toString(),
-      name: newWorldName,
-      description: newWorldDesc,
-      iconImage: newWorldIconImage,
-      mainImage: "",
-      backgroundImage: newWorldBackgroundImage,
-      creatures: [],
-      relatedCharacters: [],
-      relatedCreatures: [],
-      worldCharacters: [],
-      worldCreatures: [],
-    };
-
-    setData({ ...data, worlds: [...worlds, newWorld] });
-
+  const resetAddWorldDraft = useCallback(() => {
     setNewWorldName("");
     setNewWorldDesc("");
     setNewWorldIconImage("");
     setNewWorldBackgroundImage("");
+  }, []);
+
+  const handleAddWorld = useCallback(() => {
+    if (!newWorldName.trim()) return;
+
+    const newWorld: WorldData = {
+      id: makeId(),
+      name: newWorldName.trim(),
+      description: newWorldDesc ?? "",
+
+      iconImage: newWorldIconImage ?? "",
+      mainImage: "",
+      backgroundImage: newWorldBackgroundImage ?? "",
+
+      worldCharacters: [],
+      worldCreatures: [],
+
+      properNounKinds: DEFAULT_WORLD_PROPER_NOUN_KINDS.map((k) => ({
+        ...k,
+        meta: { ...(k as any).meta },
+      })) as any,
+      defaultProperNounKindId: "concept",
+
+      properNouns: [],
+      events: [],
+    };
+
+    setData((prev) => ({ ...prev, worlds: [...(prev.worlds ?? []), newWorld] }));
 
     setIsAddingWorld(false);
+    resetAddWorldDraft();
     setCurrentWorldIndex(worlds.length);
-    setCurrentDisplayIndex(0);
-  };
+  }, [
+    newWorldName,
+    newWorldDesc,
+    newWorldIconImage,
+    newWorldBackgroundImage,
+    setData,
+    resetAddWorldDraft,
+    worlds.length,
+  ]);
 
-  const handleDeleteWorld = () => {
+  const handleDeleteWorld = useCallback(() => {
     if (worlds.length <= 1) return;
-    const newWorlds = worlds.filter((_, i) => i !== currentWorldIndex);
-    setData({ ...data, worlds: newWorlds });
-    setCurrentWorldIndex(Math.max(0, currentWorldIndex - 1));
-    setCurrentDisplayIndex(0);
-  };
 
-  const handleNextWorld = () => {
+    setData((prev) => {
+      const nextWorlds = (prev.worlds ?? []).filter((_, i) => i !== currentWorldIndex);
+      return { ...prev, worlds: nextWorlds };
+    });
+
+    setCurrentWorldIndex((i) => Math.max(0, i - 1));
+  }, [worlds.length, setData, currentWorldIndex]);
+
+  const handleNextWorld = useCallback(() => {
+    if (!worlds.length) return;
     setCurrentWorldIndex((prev) => (prev + 1) % worlds.length);
-    setCurrentDisplayIndex(0);
-  };
+  }, [worlds.length]);
 
-  const handlePrevWorld = () => {
+  const handlePrevWorld = useCallback(() => {
+    if (!worlds.length) return;
     setCurrentWorldIndex((prev) => (prev - 1 + worlds.length) % worlds.length);
-    setCurrentDisplayIndex(0);
-  };
+  }, [worlds.length]);
 
-  const handleAddItem = (characterId?: string, creatureId?: string) => {
-    if (!currentWorld) return;
+  const handleAddItem = useCallback(
+    (id: ID) => {
+      if (!currentWorld) return;
 
-    if (characterId) {
-      const newRef = { id: Date.now().toString(), characterId };
-      handleUpdateWorld({
-        worldCharacters: [...(currentWorld?.worldCharacters || []), newRef],
-      });
-    } else if (creatureId) {
-      const newRef = { id: Date.now().toString(), creatureId };
-      handleUpdateWorld({
-        worldCreatures: [...(currentWorld?.worldCreatures || []), newRef],
-      });
-    }
+      if (addTab === "character") {
+        const newRef: WorldCharacterRef = { id: makeId(), characterId: id };
+        updateWorldAtIndex(currentWorldIndex, {
+          worldCharacters: [...(currentWorld.worldCharacters ?? []), newRef],
+        });
+      } else {
+        const newRef: WorldCreatureRef = { id: makeId(), creatureId: id };
+        updateWorldAtIndex(currentWorldIndex, {
+          worldCreatures: [...(currentWorld.worldCreatures ?? []), newRef],
+        });
+      }
 
-    setIsAddingItem(false);
-    setSearch("");
-    setCurrentDisplayIndex(displayItems.length);
-  };
+      setIsAddingItem(false);
+      setSearch("");
+    },
+    [addTab, currentWorld, currentWorldIndex, updateWorldAtIndex]
+  );
 
-  const handleDeleteItemByRefId = (
-    refId: string,
-    type: "character" | "creature"
-  ) => {
-    if (!currentWorld) return;
+  const handleUnlinkItem = useCallback(
+    (refId: ID, type: AddTab) => {
+      if (!currentWorld) return;
 
-    if (type === "character") {
-      const newCharacters = (currentWorld.worldCharacters || []).filter(
-        (ref: any) => ref.id !== refId
-      );
-      handleUpdateWorld({ worldCharacters: newCharacters });
+      if (type === "character") {
+        updateWorldAtIndex(currentWorldIndex, {
+          worldCharacters: (currentWorld.worldCharacters ?? []).filter((r) => r.id !== refId),
+        });
+      } else {
+        updateWorldAtIndex(currentWorldIndex, {
+          worldCreatures: (currentWorld.worldCreatures ?? []).filter((r) => r.id !== refId),
+        });
+      }
+    },
+    [currentWorld, currentWorldIndex, updateWorldAtIndex]
+  );
+
+  const displayItems = useMemo(() => {
+    if (!currentWorld) return [];
+
+    const chars = (currentWorld.worldCharacters ?? [])
+      .map((ref) => {
+        const found = characterById.get(ref.characterId);
+        if (!found) return null;
+        return { type: "character" as const, refId: ref.id, data: found };
+      })
+      .filter(Boolean) as any[];
+
+    const cres = (currentWorld.worldCreatures ?? [])
+      .map((ref) => {
+        const found = creatureById.get(ref.creatureId);
+        if (!found) return null;
+        return { type: "creature" as const, refId: ref.id, data: found };
+      })
+      .filter(Boolean) as any[];
+
+    return [...chars, ...cres];
+  }, [currentWorld, characterById, creatureById]);
+
+  const q = deferredSearch.trim().toLowerCase();
+
+  const addModalItems = useMemo(() => {
+    if (!currentWorld) return [];
+
+    if (addTab === "character") {
+      const added = new Set<ID>();
+      (currentWorld.worldCharacters ?? []).forEach((r) => added.add(r.characterId));
+
+      return (data.characters ?? [])
+        .filter((c) => !added.has(c.id))
+        .filter((c) => (!q ? true : (c.name ?? "").toLowerCase().includes(q)))
+        .map((c) => ({
+          id: c.id,
+          name: c.name,
+          profileImage: c.profileImage,
+        }));
     } else {
-      const newCreatures = (currentWorld.worldCreatures || []).filter(
-        (ref: any) => ref.id !== refId
-      );
-      handleUpdateWorld({ worldCreatures: newCreatures });
+      const added = new Set<ID>();
+      (currentWorld.worldCreatures ?? []).forEach((r) => added.add(r.creatureId));
+
+      return (data.creatures ?? [])
+        .filter((c) => !added.has(c.id))
+        .filter((c) => (!q ? true : (c.name ?? "").toLowerCase().includes(q)))
+        .map((c) => ({
+          id: c.id,
+          name: c.name,
+          profileImage: c.profileImage,
+        }));
     }
+  }, [addTab, currentWorld, data.characters, data.creatures, q]);
 
-    setCurrentDisplayIndex((prev) => Math.max(0, prev - 1));
-  };
+  const label = addTab === "character" ? "캐릭터" : "크리쳐";
+  const isSearching = q.length > 0;
 
-  // ✅ img: 키 렌더용 변환
-  const resolvedWorldIcon = useResolvedImage(currentWorld?.iconImage || "");
-  const resolvedWorldBg = useResolvedImage(currentWorld?.backgroundImage || "");
+  const stats = useMemo(() => {
+    const linked =
+      (currentWorld?.worldCharacters?.length ?? 0) + (currentWorld?.worldCreatures?.length ?? 0);
 
-  // ✅ Empty state
+    return {
+      worlds: worlds.length,
+      linked,
+      characters: currentWorld?.worldCharacters?.length ?? 0,
+      creatures: currentWorld?.worldCreatures?.length ?? 0,
+    };
+  }, [currentWorld, worlds.length]);
+
+  const detailEntity = useMemo(() => {
+    if (!detailOpen) return null;
+    if (detailOpen.type === "character") return characterById.get(detailOpen.id) ?? null;
+    return creatureById.get(detailOpen.id) ?? null;
+  }, [detailOpen, characterById, creatureById]);
+
+  const detailTagOptions = useMemo(() => [] as string[], []);
+
+  // Empty state (no worlds)
   if (!currentWorld) {
     return (
-      <>
-        <div className="min-h-screen gyeol-bg text-white py-12 flex items-center justify-center">
-          <div className="text-center">
-            <p className="text-lg mb-4">
-              {editMode ? "세계관을 추가해주세요" : "세계관이 존재하지 않습니다"}
-            </p>
-            {editMode && (
-              <GButton
-                variant="default"
-                onClick={() => setIsAddingWorld(true)}
-                text="세계관 추가"
-              />
-            )}
+      <div className="min-h-[100svh] gyeol-bg text-white p-6 md:p-10 flex items-center justify-center">
+        <div className="max-w-xl mx-auto space-y-4 flex flex-col items-center">
+          <div className="text-2xl font-bold">세계관이 없습니다</div>
+          <div className="text-white/60 text-sm text-center">
+            {editMode ? "편집 모드에서 세계관을 추가할 수 있어요." : "잠시 후 찾아와주세요."}
           </div>
+
+          {editMode && (
+            <GButton variant="primary" text="세계관 추가" onClick={() => setIsAddingWorld(true)} />
+          )}
+
+          <AddWorldModal
+            open={isAddingWorld && editMode}
+            onClose={() => {
+              setIsAddingWorld(false);
+              resetAddWorldDraft();
+            }}
+            name={newWorldName}
+            setName={setNewWorldName}
+            desc={newWorldDesc}
+            setDesc={setNewWorldDesc}
+            iconImage={newWorldIconImage}
+            setIconImage={setNewWorldIconImage}
+            bgImage={newWorldBackgroundImage}
+            setBgImage={setNewWorldBackgroundImage}
+            onSubmit={handleAddWorld}
+          />
         </div>
-
-        <Modal
-          open={isAddingWorld && editMode}
-          onClose={() => {
-            setIsAddingWorld(false);
-            setNewWorldName("");
-            setNewWorldDesc("");
-            setNewWorldIconImage("");
-            setNewWorldBackgroundImage("");
-          }}
-          title="세계관 추가"
-          maxWidthClassName="max-w-md"
-          footer={
-            <div className="flex justify-end gap-2">
-              <GButton
-                variant="ghost"
-                text="취소"
-                onClick={() => {
-                  setIsAddingWorld(false);
-                  setNewWorldName("");
-                  setNewWorldDesc("");
-                  setNewWorldIconImage("");
-                  setNewWorldBackgroundImage("");
-                }}
-              />
-              <GButton variant="dark" text="추가" onClick={handleAddWorld} />
-            </div>
-          }
-        >
-          <div className="space-y-6">
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">
-                세계관 아이콘 (권장: 64×64)
-              </div>
-              <ImageUpload
-                value={newWorldIconImage}
-                onChange={setNewWorldIconImage}
-              />
-            </div>
-
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">
-                세계관 배경 이미지 (권장: 1920×1080)
-              </div>
-              <ImageUpload
-                value={newWorldBackgroundImage}
-                onChange={setNewWorldBackgroundImage}
-              />
-            </div>
-
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">세계관 이름</div>
-              <input
-                type="text"
-                value={newWorldName}
-                onChange={(e) => setNewWorldName(e.target.value)}
-                placeholder="세계관 이름"
-                className="w-full h-10 px-3 rounded-xl border border-border bg-background text-foreground
-                  focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-                onKeyDown={(e) => e.key === "Enter" && handleAddWorld()}
-              />
-            </div>
-
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">설정</div>
-              <textarea
-                value={newWorldDesc}
-                onChange={(e) => setNewWorldDesc(e.target.value)}
-                placeholder="세계관 설정을 입력하세요"
-                className="w-full min-h-28 p-3 rounded-xl border border-border bg-background text-foreground resize-none
-                  focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-              />
-            </div>
-          </div>
-        </Modal>
-      </>
+      </div>
     );
   }
 
-  // ✅ AddItem 리스트 + 빈상태 처리
-  const addSource = addTab === "character" ? data.characters : data.creatures;
-  const q = search.trim().toLowerCase();
-  const filteredAddList = (addSource || []).filter((item) => {
-    if (!q) return true;
-    return (item.name || "").toLowerCase().includes(q);
-  });
-  const label = addTab === "character" ? "캐릭터" : "크리쳐";
-  const isSearching = search.trim().length > 0;
-
   return (
-    <div className="min-h-screen text-white relative gyeol-bg">
-      <div className="relative z-10 px-6 md:px-10 lg:px-12 py-12 min-h-[100dvh] lg:h-[100dvh] lg:overflow-hidden">
-        <div className="w-full h-full flex flex-col gap-6 lg:flex-row lg:items-stretch lg:justify-between">
-          {/* LEFT */}
-          <aside className="shrink-0">
-            <div className="space-y-5">
-              <div>
-                <p className="text-lg text-white/60 mb-2">LORE</p>
-                <h1 className="text-4xl font-extrabold tracking-tight">
-                  세계관 소개
-                </h1>
-              </div>
+    <div
+      className={cn(
+        "min-h-[100svh] gyeol-bg text-white relative overflow-x-hidden",
+        "md:h-[100svh] md:overflow-hidden",
+        // ✅ 높이 짧으면(md 폭이어도) 고정 해제 → 자연 스크롤
+        "[@media(max-height:973px)]:md:h-auto",
+        "[@media(max-height:973px)]:md:overflow-visible"
+      )}
+    >
+      {/* background HUD vignette */}
+      <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_18%_12%,rgba(255,255,255,0.07),transparent_45%),radial-gradient(circle_at_85%_30%,rgba(99,102,241,0.10),transparent_45%)]" />
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,rgba(0,0,0,0.10),rgba(0,0,0,0.60))]" />
 
-              <div className="flex items-start justify-between gap-3">
-                <div className="w-16 h-16 rounded-xl overflow-hidden bg-white/5 flex items-center justify-center">
-                  {resolvedWorldIcon ? (
-                    <img
-                      src={resolvedWorldIcon}
-                      alt="world icon"
-                      className="w-full h-full object-cover"
+      {/* ✅ md 이상: h-full + flex-col + min-h-0 체계 필수 */}
+      <div
+        className={cn(
+          "relative z-10 px-4 sm:px-6 md:px-10 lg:px-12 py-6 md:py-10 flex flex-col",
+          "md:h-full",
+          "[@media(max-height:973px)]:md:h-auto"
+        )}
+      >
+        {/* TOP BAR */}
+        <div className="flex items-center justify-between gap-3 shrink-0 h-10">
+          <div className="flex items-center gap-2 flex-wrap">
+            {editMode ? <HUDBadge tone="warn">EDIT</HUDBadge> : <HUDBadge>VIEW</HUDBadge>}
+          </div>
+        </div>
+
+        {/* DOSSIER */}
+        <HUDPanel className="p-6 mt-4 sm:mt-6 shrink-0">
+          <div className="flex flex-col">
+            <div className="text-[11px] tracking-[0.26em] text-white/55 pb-4">WORLDS</div>
+            {/* ✅ 모바일에서 버튼 줄바꿈/정렬 안정화 */}
+            <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
+              <div className="min-w-0 flex-1">
+
+                <div className="flex items-center gap-3 min-w-0">
+                  <div className="w-11 h-11 rounded-xl overflow-hidden bg-white/5 flex items-center justify-center shrink-0">
+                    <WorldThumbCard name={currentWorld.name} image={currentWorld.iconImage} />
+                  </div>
+
+                  {editMode ? (
+                    <input
+                      value={nameDraft}
+                      onChange={(e) => setNameDraft(e.target.value)}
+                      className="min-w-0 flex-1 bg-white/10 border border-white/0 rounded-xl px-3 py-2 text-white font-normal
+                      focus:outline-none focus:ring-2 focus:ring-white/20"
+                      placeholder="세계관 이름"
                     />
                   ) : (
-                    <span className="text-xs text-white/40">NO ICON</span>
+                    <div className="min-w-0 text-2xl sm:text-3xl font-extrabold tracking-tight truncate">
+                      {currentWorld.name}
+                    </div>
+                  )}
+
+                  {editMode && (
+                    <GButton
+                      variant="ghost"
+                      size="icon"
+                      icon={<Edit2 className="w-5 h-5" />}
+                      onClick={openBackgroundModal}
+                      title="아이콘/배경 변경"
+                    />
                   )}
                 </div>
               </div>
-            </div>
-          </aside>
 
-          {/* CENTER */}
-          <main className="w-full lg:flex-1 flex">
-            <div className="w-full flex items-center justify-center lg:px-6">
-              <div
-                className="w-[90%] aspect-[16/9] max-h-[80vh] rounded-2xl overflow-hidden relative"
-                style={{
-                  backgroundImage: resolvedWorldBg ? `url(${resolvedWorldBg})` : undefined,
-                  backgroundSize: "cover",
-                  backgroundPosition: "center",
-                }}
-              >
-                {!resolvedWorldBg && <div className="absolute inset-0 gyeol-bg" />}
-                <div className="absolute inset-0 bg-black/45 pointer-events-none" />
-              </div>
-            </div>
-          </main>
-
-          {/* RIGHT */}
-          <aside className="w-full lg:w-[340px] shrink-0 lg:text-right lg:h-full lg:self-stretch">
-            {/* ✅ space-y 대신 flex-col: 스크롤 영역 분배를 위해 */}
-            <div className="h-full flex flex-col gap-4 lg:min-h-0">
-              {/* ✅ TOP: 고정 영역 */}
-              <div className="shrink-0 space-y-4">
-                {/* name */}
-                <div className="flex items-start justify-between gap-3 lg:flex-row-reverse">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-3">
-                      {editMode ? (
-                        <>
-                          <input
-                            value={currentWorld.name}
-                            onChange={(e) => handleUpdateWorld({ name: e.target.value })}
-                            className="flex-1 bg-white/10 border border-white/0 rounded-xl px-3 py-2 text-white font-normal
-                    focus:outline-none focus:ring-2 focus:ring-white/20"
-                            placeholder="세계관 이름"
-                          />
-                          <GButton
-                            variant="ghost"
-                            size="icon"
-                            icon={<Edit2 className="w-5 h-5" />}
-                            onClick={openBackgroundModal}
-                            title="배경/아이콘 변경"
-                          />
-                        </>
-                      ) : (
-                        <div className="text-3xl font-semibold truncate">{currentWorld.name}</div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* paging */}
-                <div className="flex items-center justify-between lg:justify-start lg:gap-3">
+              {/* ✅ 우측 컨트롤: 모바일에선 왼쪽 정렬 + 줄바꿈 */}
+              <div className="flex items-center justify-between lg:justify-end gap-3 flex-wrap">
+                <div className="flex items-center gap-2">
                   <GButton
                     variant="ghost"
                     size="icon"
@@ -394,7 +465,7 @@ export default function Worlds() {
                     onClick={handlePrevWorld}
                     title="이전 세계관"
                   />
-                  <div className="text-xs text-white/60">
+                  <div className="text-xs text-white/60 min-w-[64px] text-center">
                     {currentWorldIndex + 1} / {worlds.length}
                   </div>
                   <GButton
@@ -406,11 +477,10 @@ export default function Worlds() {
                   />
                 </div>
 
-                {/* add/delete world */}
                 {editMode && (
-                  <div className="grid grid-cols-2 gap-2 lg:justify-end">
+                  <div className="flex items-center gap-2">
                     <GButton
-                      variant="ghost"
+                      variant="neutral"
                       icon={<Plus className="w-4 h-4" />}
                       text="추가"
                       onClick={() => setIsAddingWorld(true)}
@@ -425,258 +495,218 @@ export default function Worlds() {
                   </div>
                 )}
               </div>
+            </div>
 
-              {/* ✅ DESCRIPTION: 일정 높이 + 스크롤 (lg 이상) */}
-              <div className="shrink-0 lg:max-h-[240px] lg:min-h-[180px] lg:overflow-auto lg:pr-1 scroll-dark">
-                {editMode && <div className="text-left text-xs text-white/60 mb-3">설정</div>}
+            {/* brief */}
+            <div className="mt-4">
+              <div className="text-[12px] tracking-[0.26em] text-white/55">WORLD BRIEF</div>
+
+              <div className="mt-3">
                 {editMode ? (
                   <textarea
-                    value={currentWorld.description}
-                    onChange={(e) => handleUpdateWorld({ description: e.target.value })}
-                    className="w-full bg-white/10 border border-white/0 rounded-xl px-3 py-2 text-sm text-white
-            focus:outline-none focus:ring-2 focus:ring-white/20 resize-none
-            h-[180px] lg:h-full"
+                    value={descDraft}
+                    onChange={(e) => setDescDraft(e.target.value)}
+                    className="w-full min-h-24 p-3 rounded-xl bg-black/25 text-white border border-white/10
+                            placeholder:text-white/30 outline-none focus:ring-2 focus:ring-white/15 focus:border-white/20 transition resize-none scroll-dark"
                     placeholder="세계관 설정을 입력하세요"
                   />
                 ) : (
-                  <p className="text-sm text-white/70 text-left leading-relaxed whitespace-pre-wrap
-          max-h-[180px] lg:max-h-none overflow-auto lg:overflow-visible">
+                  <p className="min-h-0 max-h-28 md:max-h-24 overflow-y-auto scroll-dark text-sm text-white/70 leading-relaxed whitespace-pre-wrap">
                     {currentWorld.description || "설명이 없습니다"}
                   </p>
                 )}
               </div>
+            </div>
+          </div>
+        </HUDPanel>
 
-              {/* ✅ THUMBNAILS: 남는 공간 전부 + 내부 스크롤 */}
-              <div className="flex-1 min-h-0 overflow-hidden">
-                <div className="h-full overflow-auto pr-1 scroll-dark">
-                  <div className="flex items-center justify-between mb-2">
-                    <div className="text-sm text-white/60">
-                      캐릭터 / 크리쳐 ({displayItems.length})
-                    </div>
-                    {editMode && (
-                      <GButton
-                        variant="ghost"
-                        icon={<Plus className="w-4 h-4" />}
-                        text="추가"
-                        onClick={() => {
-                          setIsAddingItem(true);
-                          setAddTab("character");
-                          setSearch("");
-                        }}
-                      />
-                    )}
+        {/* CONTENT */}
+        {/* ✅ 모바일: 자연스럽게 아래로 늘어남 / md+: 남은 영역 flex-1로 고정 */}
+        <div className="mt-4 md:mt-6 flex-1 min-h-0">
+          {/* md 이상에선 내부 높이 고정이 필요 */}
+          <div className={cn(
+            "md:h-full md:overflow-hidden",
+            "[@media(max-height:973px)]:md:h-auto",
+            "[@media(max-height:973px)]:md:overflow-visible"
+          )}>
+            <div className="grid grid-cols-1 lg:grid-cols-[1.15fr_0.85fr] gap-4 md:h-full md:min-h-0 items-stretch">
+              {/* LEFT */}
+              <HUDPanel className="p-6 md:h-full md:min-h-0 flex flex-col overflow-hidden">
+                {/* header */}
+                <div className="flex items-center justify-between gap-3 shrink-0">
+                  <div>
+                    <div className="text-[11px] tracking-[0.26em] text-white/55">SCENE PREVIEW</div>
+                    <div className="mt-1 text-sm text-white/60">전경</div>
                   </div>
 
+                  <GButton
+                    variant="primary"
+                    text="빠져들기"
+                    onClick={() => setLocation(`/worlds/${currentWorld.id}`)}
+                  />
+                </div>
+
+                {/* preview */}
+                <div className="mt-4 flex-1 min-h-[240px]">
+                  <div
+                    className="w-full h-full rounded-2xl overflow-hidden relative border border-white/10 bg-black/10"
+                    style={{
+                      backgroundImage: resolvedWorldBg ? `url(${resolvedWorldBg})` : undefined,
+                      backgroundSize: "cover",
+                      backgroundPosition: "center",
+                    }}
+                  >
+                    {!resolvedWorldBg && <div className="absolute inset-0 gyeol-bg" />}
+                    <div className="absolute inset-0 bg-black/10 pointer-events-none" />
+                    <div className="pointer-events-none absolute inset-0 opacity-[0.12] bg-[linear-gradient(rgba(255,255,255,0.12)_1px,transparent_1px)] bg-[length:100%_3px]" />
+                  </div>
+                </div>
+              </HUDPanel>
+
+              {/* RIGHT */}
+              <HUDPanel className="p-6 md:h-full md:min-h-0 flex flex-col min-h-0 md:max-h-[40vw] md:overflow-y-scroll">
+                <div className="flex items-center justify-between gap-3 shrink-0">
+                  <div>
+                    <div className="text-[11px] tracking-[0.26em] text-white/55">LINKED ENTITIES</div>
+                    <div className="mt-1 text-sm text-white/60">캐릭터/크리쳐</div>
+                  </div>
+
+                  {editMode && (
+                    <GButton
+                      variant="ghost"
+                      icon={<Plus className="w-4 h-4" />}
+                      text="추가"
+                      onClick={() => {
+                        setIsAddingItem(true);
+                        setAddTab("character");
+                        setSearch("");
+                      }}
+                    />
+                  )}
+                </div>
+
+                {/* body */}
+                {/* ✅ 모바일: 그냥 늘어나되, 너무 길면 자연 스크롤(페이지 스크롤) */}
+                {/* ✅ md 이상: 이 영역만 스크롤 */}
+                <div className={cn(
+                  "mt-4 flex-1 min-h-0 scroll-dark pr-1",
+                  "md:overflow-y-auto",
+                  "[@media(max-height:973px)]:md:overflow-visible",
+                  "[@media(max-height:973px)]:md:flex-none"
+                )}>
                   {displayItems.length === 0 ? (
-                    <div className="text-xs text-left text-white/40">
-                      등록된 항목이 없습니다
+                    <div className="rounded-2xl border border-white/10 bg-black/20 p-4 text-xs text-white/45">
+                      등록된 항목이 없습니다.
+                      {editMode ? " 오른쪽 상단 ‘추가’로 연결해줘." : ""}
                     </div>
                   ) : (
-                    <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 md:grid-cols-4">
-                      {displayItems.map((it, idx) => (
-                        <WorldThumbCard
-                          key={it.id}
-                          name={it.data?.name}
-                          image={it.data?.profileImage}
-                          active={idx === currentDisplayIndex}
-                          editMode={editMode}
-                          onClick={() => setCurrentDisplayIndex(idx)}
-                          onDelete={() => handleDeleteItemByRefId(it.id, it.type)}
-                        />
+                    <div className="grid gap-3 grid-cols-2 sm:grid-cols-3 lg:grid-cols-2 xl:grid-cols-3">
+                      {displayItems.map((it) => (
+                        <div key={it.refId} className="relative group">
+                          {/* 썸네일 클릭 = 상세 */}
+                          <button
+                            type="button"
+                            className="w-full text-left"
+                            onClick={() => {
+                              setDetailOpen({ type: it.type, id: it.data.id });
+                              setDetailSubIndex(0);
+                            }}
+                          >
+                            <WorldThumbCard
+                              name={it.data?.name}
+                              image={it.data?.profileImage}
+                              editMode={editMode}
+                            />
+                          </button>
+
+                          {/* ✅ editMode일 때만 연결 해제 버튼 */}
+                          {/* ✅ GButton danger unlink */}
+                          {editMode && (
+                            <GButton
+                              variant="danger"
+                              size="icon"
+                              icon={<Unlink className="w-4 h-4" />}
+                              title="연결 해제"
+                              onClick={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                handleUnlinkItem(it.refId, it.type);
+                              }}
+                              className={cn(
+                                "absolute top-2 right-2 z-20",
+                              )}
+                            />
+                          )}
+                        </div>
                       ))}
                     </div>
                   )}
                 </div>
-              </div>
+              </HUDPanel>
             </div>
-          </aside>
+          </div>
         </div>
 
-        {/* Add World Modal */}
-        <Modal
-          open={isAddingWorld && editMode}
-          onClose={() => {
-            setIsAddingWorld(false);
-            setNewWorldName("");
-            setNewWorldDesc("");
-            setNewWorldIconImage("");
-            setNewWorldBackgroundImage("");
-          }}
-          title="세계관 추가"
-          maxWidthClassName="max-w-md"
-          footer={
-            <div className="flex justify-end gap-2">
-              <GButton
-                variant="default"
-                text="취소"
-                onClick={() => {
-                  setIsAddingWorld(false);
-                  setNewWorldName("");
-                  setNewWorldDesc("");
-                  setNewWorldIconImage("");
-                  setNewWorldBackgroundImage("");
-                }}
-              />
-              <GButton variant="dark" text="추가" onClick={handleAddWorld} />
-            </div>
-          }
-        >
-          <div className="space-y-6">
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">
-                세계관 아이콘 (권장: 64×64)
-              </div>
-              <ImageUpload
-                value={newWorldIconImage}
-                onChange={setNewWorldIconImage}
-              />
-            </div>
 
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">
-                세계관 배경 이미지 (권장: 1920×1080)
-              </div>
-              <ImageUpload
-                value={newWorldBackgroundImage}
-                onChange={setNewWorldBackgroundImage}
-              />
-            </div>
-
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">세계관 이름</div>
-              <input
-                type="text"
-                value={newWorldName}
-                onChange={(e) => setNewWorldName(e.target.value)}
-                placeholder="세계관 이름"
-                className="w-full h-10 px-3 rounded-xl border border-border bg-background text-foreground
-                  focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-                onKeyDown={(e) => e.key === "Enter" && handleAddWorld()}
-              />
-            </div>
-
-            <div>
-              <div className="mb-2 text-xs text-muted-foreground">설정</div>
-              <textarea
-                value={newWorldDesc}
-                onChange={(e) => setNewWorldDesc(e.target.value)}
-                placeholder="세계관 설정을 입력하세요"
-                className="w-full min-h-28 p-3 rounded-xl border border-border bg-background text-foreground resize-none
-                  focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-              />
-            </div>
-          </div>
-        </Modal>
-
-        {/* Edit Background Modal */}
-        <Modal
-          open={isEditingBackground && editMode}
-          onClose={closeBackgroundModal}
-          title="배경/아이콘 변경"
-          maxWidthClassName="max-w-2xl"
-          footer={
-            <div className="flex justify-end gap-2">
-              <GButton variant="ghost" text="취소" onClick={closeBackgroundModal} />
-              <GButton variant="dark" text="저장" onClick={saveBackground} />
-            </div>
-          }
-        >
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <div>
-              <p className="mb-2 text-xs font-medium text-foreground">
-                배경 이미지
-              </p>
-              <ImageUpload value={backgroundUrl} onChange={setBackgroundUrl} />
-            </div>
-
-            <div>
-              <p className="mb-2 text-xs font-medium text-foreground">
-                세계관 아이콘 (권장: 64×64)
-              </p>
-              <ImageUpload value={worldIconUrl} onChange={setWorldIconUrl} />
-            </div>
-          </div>
-        </Modal>
-
-        {/* Add Item Modal */}
-        <Modal
-          open={isAddingItem && editMode}
-          onClose={() => {
-            setIsAddingItem(false);
-            setSearch("");
-          }}
-          title="항목 추가"
-          maxWidthClassName="max-w-3xl"
-          footer={
-            <div className="flex justify-end gap-2">
-              <GButton
-                variant="dark"
-                text="닫기"
-                onClick={() => {
-                  setIsAddingItem(false);
-                  setSearch("");
-                }}
-              />
-            </div>
-          }
-        >
-          {/* Tabs */}
-          <div className="flex items-center gap-2 mb-4">
-            <GButton
-              variant={addTab === "character" ? "dark" : "default"}
-              text="캐릭터"
-              onClick={() => setAddTab("character")}
-              className="flex-1"
-            />
-            <GButton
-              variant={addTab === "creature" ? "dark" : "default"}
-              text="크리쳐"
-              onClick={() => setAddTab("creature")}
-              className="flex-1"
-            />
-          </div>
-
-          {/* Search */}
-          <div className="mb-4">
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={`${label} 이름 검색`}
-              className="w-full h-10 px-3 rounded-xl border border-border bg-background text-foreground
-                focus:outline-none focus:ring-2 focus:ring-white/20 transition"
-            />
-          </div>
-
-          {/* Grid / Empty */}
-          {filteredAddList.length === 0 ? (
-            <div className="rounded-2xl border border-border bg-secondary/20 p-6 text-center">
-              <p className="text-sm font-medium text-foreground">
-                {isSearching ? "검색 결과가 없습니다." : `${label}가 없습니다.`}
-              </p>
-              {!isSearching && (
-                <p className="mt-2 text-xs text-muted-foreground">
-                  좌측의 <b>{label}</b> 탭에서 {label}를 추가해주세요!
-                </p>
-              )}
-            </div>
-          ) : (
-            <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 gap-3">
-              {filteredAddList.map((item) => (
-                <AddItemCard
-                  key={item.id}
-                  name={item.name}
-                  image={item.profileImage}
-                  onPick={() =>
-                    addTab === "character"
-                      ? handleAddItem(item.id)
-                      : handleAddItem(undefined, item.id)
-                  }
-                />
-              ))}
-            </div>
-          )}
-        </Modal>
       </div>
+      {/* Modals */}
+      <AddWorldModal
+        open={isAddingWorld && editMode}
+        onClose={() => {
+          setIsAddingWorld(false);
+          resetAddWorldDraft();
+        }}
+        name={newWorldName}
+        setName={setNewWorldName}
+        desc={newWorldDesc}
+        setDesc={setNewWorldDesc}
+        iconImage={newWorldIconImage}
+        setIconImage={setNewWorldIconImage}
+        bgImage={newWorldBackgroundImage}
+        setBgImage={setNewWorldBackgroundImage}
+        onSubmit={handleAddWorld}
+      />
+
+      <EditWorldMediaModal
+        open={isEditingBackground && editMode}
+        onClose={closeBackgroundModal}
+        onSave={saveBackground}
+        backgroundUrl={backgroundUrl}
+        setBackgroundUrl={setBackgroundUrl}
+        iconUrl={worldIconUrl}
+        setIconUrl={setWorldIconUrl}
+      />
+
+      <AddWorldItemModal
+        open={isAddingItem && editMode}
+        onClose={() => {
+          setIsAddingItem(false);
+          setSearch("");
+        }}
+        addTab={addTab}
+        setAddTab={setAddTab}
+        search={search}
+        setSearch={setSearch}
+        label={label}
+        isSearching={isSearching}
+        items={addModalItems}
+        onPick={handleAddItem}
+      />
+      {detailEntity && (
+        <EntityDetailFullscreen
+          entity={detailEntity as any}
+          viewSubIndex={detailSubIndex}
+          setViewSubIndex={setDetailSubIndex}
+          onClose={() => {
+            setDetailOpen(null);
+            setDetailSubIndex(0);
+          }}
+          editable={false}
+          onDelete={undefined}
+          onPatch={undefined}
+          tagOptions={detailTagOptions}
+        />
+      )}
     </div>
   );
 }

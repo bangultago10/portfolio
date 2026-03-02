@@ -4,46 +4,54 @@ import NotFound from "@/pages/NotFound";
 import Home from "@/pages/Home";
 import Profile from "@/pages/Profile";
 import Worlds from "@/pages/Worlds";
+import WorldDetail from "@/pages/world-detail/WorldDetail";
 import Characters from "@/pages/Characters";
 import Creatures from "@/pages/Creatures";
-import Sidebar from "@/components/Sidebar";
+import Sidebar from "@/components/sidebar/Sidebar";
 import { Route, Switch } from "wouter";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { ThemeProvider } from "./contexts/ThemeContext";
 import { PortfolioProvider } from "./contexts/PortfolioContext";
 import { usePortfolio } from "./hooks/usePortfolio";
-import { useState } from "react";
+import { useCallback } from "react";
+import { LoadingOverlay } from "./components/ui/loading-overlay";
 
 function Router() {
   return (
     <Switch>
       <Route path={"/"} component={Home} />
       <Route path={"/worlds"} component={Worlds} />
+      <Route path={"/worlds/:worldId"} component={WorldDetail} />{" "}
+      {/* ✅ 추가 */}
       <Route path={"/characters"} component={Characters} />
       <Route path={"/creatures"} component={Creatures} />
       <Route path={"/profile"} component={Profile} />
       <Route path={"/404"} component={NotFound} />
-      {/* Final fallback route */}
       <Route component={NotFound} />
     </Switch>
   );
 }
 
 function AppContent() {
-  const portfolioData = usePortfolio();
-  const [editMode, setEditMode] = useState(portfolioData.data.settings.editMode);
+  const portfolio = usePortfolio();
+  const editMode = !!portfolio.data.settings.editMode;
+
+  const setEditMode = useCallback(
+    (mode: boolean) => {
+      portfolio.setData(prev => ({
+        ...prev,
+        settings: { ...prev.settings, editMode: mode },
+      }));
+    },
+    [portfolio]
+  );
 
   return (
-    <PortfolioProvider
-      value={{
-        ...portfolioData,
-        editMode,
-        setEditMode,
-      }}
-    >
-      <div className="min-h-screen bg-background text-foreground flex">
+    <PortfolioProvider value={{ ...portfolio, editMode, setEditMode }}>
+      <LoadingOverlay show={!portfolio.isLoaded} />
+      <div className="min-h-[100svh] bg-background text-foreground relative overflow-x-clip">
         <Sidebar />
-        <main className="flex-1 md:ml-0 ml-0">
+        <main className="w-full min-w-0 pl-0 md:pl-20">
           <Router />
         </main>
       </div>

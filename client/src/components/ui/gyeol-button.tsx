@@ -1,13 +1,13 @@
 import * as React from "react";
 import { cn } from "@/lib/utils";
 
-type GButtonVariant = "default" | "danger" | "primary" | "dark" | "ghost";
+type GButtonVariant = "neutral" | "primary" | "danger" | "ghost" | "onlyText";
 type GButtonSize = "sm" | "md" | "icon";
 
 type Props = {
   onClick?: React.MouseEventHandler<HTMLButtonElement>;
   icon?: React.ReactNode;
-  text?: string; // 없어도 됨
+  text?: string;
   variant?: GButtonVariant;
   size?: GButtonSize;
   disabled?: boolean;
@@ -16,40 +16,60 @@ type Props = {
   className?: string;
 };
 
-const variantClass: Record<GButtonVariant, string> = {
-  // 기본(밝은 회색)
-  default:
-    "bg-white/90 text-zinc-900 border border-white/60 backdrop-blur " +
-    "shadow-[0_2px_4px_rgba(0,0,0,0.20)] hover:shadow-[0_2px_6px_rgba(0,0,0,0.22)]",
-  // 추가/강조(파랑)
-  primary:
-    "bg-blue-600 text-white border border-blue-500/60 " +
-    "shadow-[0_10px_24px_rgba(0,0,0,0.18)]",
-  // 삭제/위험(빨강)
-  danger:
-    "bg-red-600 text-white border border-red-500/60 " +
-    "shadow-[0_10px_24px_rgba(0,0,0,0.18)]",
-  // 검정 버튼
-  dark:
-    "bg-zinc-950 text-white border border-white/10 " +
-    "shadow-[0_10px_24px_rgba(0,0,0,0.22)]",
-  // 투명(배경 위 글래스 느낌)
-  ghost:
-    "bg-white/20 text-white backdrop-blur " +
-    "shadow-[0_10px_24px_rgba(0,0,0,0.18)]",
+const SIZE: Record<GButtonSize, string> = {
+  sm: "gyeol-button--sm",
+  md: "gyeol-button--md",
+  icon: "gyeol-button--icon",
 };
 
-const sizeClass: Record<GButtonSize, string> = {
-  sm: "h-9 px-3 text-sm rounded-xl",
-  md: "h-10 px-4 text-sm rounded-xl",
-  icon: "h-11 w-11 p-0 rounded-4xl",
-};
+function tokens(variant: GButtonVariant) {
+  // ✅ 흰/검 배경 어디서든 보이는 neutral 기본
+  const neutral = {
+    bg: "rgba(32,32,40,0.86)", // 🔥 더 밝은 딥톤
+    fg: "rgba(255,255,255,0.94)",
+
+    bd: "rgba(255,255,255,0.26)", // 🔥 외곽선 강화
+    in: "rgba(0,0,0,0.55)", // 🔥 내부 대비 증가
+
+    hbg: "rgba(40,40,50,0.92)",
+    hbd: "rgba(255,255,255,0.38)",
+
+    glow: "rgba(255,255,255,0.12)",
+  };
+  if (variant === "primary")
+    return {
+      // 🔶 WARN tone (amber)
+      bg: "rgba(245,158,11,0.16)", // amber-500 tint
+      fg: "rgba(255,251,235,0.95)", // amber-50~100 계열
+
+      bd: "rgba(253,224,71,0.32)", // amber-300 border
+      in: "rgba(0,0,0,0.28)",
+
+      hbg: "rgba(245,158,11,0.24)", // hover 더 밝게
+      hbd: "rgba(253,224,71,0.48)",
+
+      glow: "rgba(245,158,11,0.20)", // amber glow
+    };
+
+  if (variant === "danger")
+    return {
+      bg: "rgba(239,68,68,0.16)",
+      fg: "rgba(255,255,255,0.94)",
+      bd: "rgba(252,165,165,0.30)",
+      in: "rgba(0,0,0,0.28)",
+      hbg: "rgba(239,68,68,0.22)",
+      hbd: "rgba(252,165,165,0.42)",
+      glow: "rgba(239,68,68,0.18)",
+    };
+
+  return neutral;
+}
 
 export default function GButton({
   onClick,
   icon,
   text,
-  variant = "default",
+  variant = "neutral",
   size = "md",
   disabled = false,
   title,
@@ -57,6 +77,14 @@ export default function GButton({
   className,
 }: Props) {
   const isIconOnly = size === "icon" || (!!icon && !text);
+  const v = tokens(variant);
+
+  const rootVariantClass =
+    variant === "onlyText"
+      ? "gyeol-button--onlyText"
+      : variant === "ghost"
+        ? "gyeol-button--ghost"
+        : "gyeol-button--solid";
 
   return (
     <button
@@ -65,29 +93,56 @@ export default function GButton({
       disabled={disabled}
       title={title || text}
       className={cn(
-        // base
-        "inline-flex items-center justify-center gap-2 font-medium",
-        "transition-all duration-200 select-none",
-        "hover:-translate-y-0.5 hover:shadow-[0_14px_28px_rgba(0,0,0,0.22)]",
-        "active:translate-y-0 active:shadow-[0_8px_18px_rgba(0,0,0,0.16)]",
-        "focus:outline-none focus:ring-2 focus:ring-white/40",
-        "disabled:opacity-50 disabled:pointer-events-none disabled:transform-none",
-        // skin
-        variantClass[variant],
-        // size
-        sizeClass[size],
-        // icon-only이면 gap 제거
-        isIconOnly ? "gap-0" : "",
+        "group gyeol-button [contain:paint]",
+        SIZE[size],
+        isIconOnly ? "gyeol-button--iconOnly" : "",
+        rootVariantClass,
         className
       )}
+      style={
+        variant === "onlyText"
+          ? undefined
+          : ({
+              ["--g-bg" as any]: v.bg,
+              ["--g-fg" as any]: v.fg,
+              ["--g-bd" as any]: v.bd,
+              ["--g-in" as any]: v.in,
+              ["--g-hbg" as any]: v.hbg,
+              ["--g-hbd" as any]: v.hbd,
+              ["--g-glow" as any]: v.glow,
+            } as React.CSSProperties)
+      }
     >
-      {icon ? (
-        <span className={cn("inline-flex items-center justify-center", isIconOnly ? "" : "-ml-0.5")}>
-          {icon}
-        </span>
-      ) : null}
+      {/* frame / fx (onlyText는 제외) */}
+      {variant !== "onlyText" && (
+        <>
+          <span aria-hidden className="gyeol-button__frame" />
+          {variant !== "ghost" && (
+            <span aria-hidden className="gyeol-button__top" />
+          )}
+          <span aria-hidden className="gyeol-button__glow" />
+          <span aria-hidden className="gyeol-button__focus" />
+        </>
+      )}
 
-      {text ? <span className="whitespace-nowrap">{text}</span> : null}
+      <span
+        className={cn(
+          "relative inline-flex items-center justify-center",
+          isIconOnly ? "" : "gap-2"
+        )}
+      >
+        {icon ? (
+          <span
+            className={cn(
+              "inline-flex items-center justify-center",
+              isIconOnly ? "" : "-ml-0.5"
+            )}
+          >
+            {icon}
+          </span>
+        ) : null}
+        {text ? <span className="whitespace-nowrap">{text}</span> : null}
+      </span>
     </button>
   );
 }
